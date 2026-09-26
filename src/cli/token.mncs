@@ -1,0 +1,169 @@
+mncs 0.18;
+
+// mncs.cli.token.v1 — bounded command-line token vocabulary.
+//
+// A Token is one argv entry projected into the CLI window: at most 64 live
+// bytes plus the declared length. The 64-byte window is this module's chosen
+// substrate width; option/flag spellings live well inside it, and longer
+// values (identities, paths) are carried whole up to the window with
+// `truncated` set so the parser reports TruncatedToken instead of silently
+// matching a prefix.
+//
+// Command and option NAMES are a narrower vocabulary still: at most 32
+// bytes of lowercase ASCII, digits, and `-`. Name matching goes through
+// `mncs.std.text_view` fixed-width matchers over an explicit 32-byte
+// projection, so matching is total and allocation-free. There are no string
+// literals in current MNCS; callers spell names as numeric byte arrays with
+// a comment giving the intended spelling (see `mncs.cli.app`).
+//
+// Byte codes used here: 45 `-`, 61 `=`.
+
+module mncs.cli.token.v1;
+
+use mncs.std.text_view.v1 as text;
+
+record Token {
+    bytes: [byte; 64],
+    len: u64,
+    truncated: bool
+}
+
+record NameValue {
+    name: Token,
+    has_value: bool,
+    value: Token
+}
+
+fn empty_token() -> (result: Token) {
+    return Token { bytes: [0; 64], len: 0, truncated: false };
+}
+
+// Pack eight byte values into one spelling chunk. Without string
+// literals this is the explicit spelling primitive: callers write the
+// byte codes with a comment giving the intended text.
+fn pack8(a: byte, b: byte, c: byte, d: byte, e: byte, f: byte, g: byte, h: byte) -> (result: [byte; 8]) {
+    return [a, b, c, d, e, f, g, h];
+}
+
+// Project one argv entry into the token window. Entries wider than 64
+// bytes keep their first 64 bytes and set `truncated`.
+fn from_entry(entry: [byte; up_to 1024], entry_len: u64) -> (result: Token) {
+    let live: u64 = select(entry_len <= entry.len, entry_len, entry.len);
+    let wide: bool = live > 64;
+    let take: u64 = select(wide, 64, live);
+    let blank: [byte; 64] = [0; 64];
+    return Token {
+        bytes: copy_span(blank, 0, entry, 0, take),
+        len: take,
+        truncated: wide
+    };
+}
+
+// A token spelled directly in-language (tests, static tables). The caller
+// guarantees `len <= 64`.
+fn from_bytes(bytes: [byte; 64], len: u64) -> (result: Token) {
+    let live: u64 = select(len <= 64, len, 64);
+    return Token { bytes: bytes, len: live, truncated: len > 64 };
+}
+
+fn token_len(token: Token) -> (result: u64) {
+    return token.len;
+}
+
+// Long-flag shape: `--` followed by at least one more byte.
+fn is_long_flag(token: Token) -> (result: bool) {
+    if token.len < 3 {
+        return false;
+    }
+    return token.bytes[0] == 45 && token.bytes[1] == 45;
+}
+
+// Long-option shape with an attached value: `--name=value`.
+fn is_long_assignment(token: Token) -> (result: bool) {
+    if token.len < 4 {
+        return false;
+    }
+    if token.bytes[0] == 45 && token.bytes[1] == 45 {
+        return find_byte(token, 61) < token.len;
+    }
+    return false;
+}
+
+// Exact token equality over live bytes.
+fn token_eq(left: Token, right: Token) -> (result: bool) {
+    if left.len == right.len && left.truncated == right.truncated {
+        iterate i over left.bytes carrying same: bool = true {
+            let live: bool = i < left.len;
+            next same = same && select(live, left.bytes[i] == right.bytes[i], true);
+        }
+        return same;
+    }
+    return false;
+}
+
+// First index of `needle` in the live bytes, or `token.len` when absent.
+fn find_byte(token: Token, needle: byte) -> (result: u64) {
+    iterate i over token.bytes carrying pos: u64 = token.len {
+        let hit: bool = i < token.len && token.bytes[i] == needle && pos == token.len;
+        next pos = select(hit, i, pos);
+    }
+    return pos;
+}
+
+// Split `--name=value` into name and value halves. Tokens without `=`
+// report `has_value = false` with an empty value.
+fn split_assignment(token: Token) -> (result: NameValue) {
+    let cut: u64 = find_byte(token, 61);
+    if cut < token.len {
+        let blank: [byte; 64] = [0; 64];
+        let rest: u64 = token.len -% cut -% 1;
+        return NameValue {
+            name: Token {
+                bytes: copy_span(blank, 0, token.bytes, 0, cut),
+                len: cut,
+                truncated: false
+            },
+            has_value: true,
+            value: Token {
+                bytes: copy_span(blank, 0, token.bytes, cut +% 1, rest),
+                len: rest,
+                truncated: token.truncated
+            }
+        };
+    }
+    return NameValue { name: token, has_value: false, value: empty_token() };
+}
+
+// Drop the leading `--` from a long flag/option token.
+fn strip_dashes(token: Token) -> (result: Token) {
+    if token.len < 3 {
+        return empty_token();
+    }
+    if token.bytes[0] == 45 && token.bytes[1] == 45 {
+        let blank: [byte; 64] = [0; 64];
+        let rest: u64 = token.len -% 2;
+        return Token {
+            bytes: copy_span(blank, 0, token.bytes, 2, rest),
+            len: rest,
+            truncated: token.truncated
+        };
+    }
+    return token;
+}
+
+// Project a token into the 32-byte name window for descriptor matching.
+// Names longer than 32 bytes never match; the caller reports the token
+// as unknown rather than matching a prefix.
+fn name_key(token: Token) -> (result: [byte; 32]) {
+    let blank: [byte; 32] = [0; 32];
+    let take: u64 = select(token.len <= 32, token.len, 32);
+    return copy_span(blank, 0, token.bytes, 0, take);
+}
+
+// Match a token against a descriptor name spelling.
+fn name_matches(token: Token, name: [byte; 32], name_len: u64) -> (result: bool) {
+    if token.len == name_len && token.len <= 32 {
+        return text.matches32(name_key(token), token.len, name, name_len);
+    }
+    return false;
+}

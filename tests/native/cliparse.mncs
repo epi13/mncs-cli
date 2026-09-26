@@ -1,0 +1,320 @@
+mncs 0.18;
+
+// Native contracts for the mncs.cli parsing layers: tokens, descriptors,
+// argument parsing, rendering primitives, and outcome mapping. Every
+// expectation is an in-language assertion with a stable numeric code.
+
+module mncs.cli.test.cliparse.v1;
+
+use mncs.test.assertions;
+use mncs.test.suite;
+use mncs.cli.token.v1 as token;
+use mncs.cli.schema.v1 as schema;
+use mncs.cli.parse.v1 as parse;
+use mncs.cli.render.v1 as render;
+use mncs.cli.outcome.v1 as outcome;
+use mncs.std.application.v1 as appctx;
+
+// One live argv entry as a token.
+fn entry3(a: byte, b: byte, c: byte) -> (result: Token) {
+    let raw: [byte; up_to 1024] = [a, b, c];
+    return token.from_entry(raw, 3);
+}
+
+// A `--format`-style token from explicit bytes plus length.
+fn dash_token(bytes: [byte; up_to 1024], len: u64) -> (result: Token) {
+    return token.from_entry(bytes, len);
+}
+
+// Reference parsing descriptor: --format <value>, --verbose (flag),
+// --mode <value, required>.
+fn parse_spec() -> (result: CommandSpec) {
+    let format_opt: OptionSpec = schema.make_option(token.pack8(102, 111, 114, 109, 97, 116, 0, 0), 6, OptionKind.Value, false);
+    let verbose_opt: OptionSpec = schema.make_option(token.pack8(118, 101, 114, 98, 111, 115, 101, 0), 7, OptionKind.Flag, false);
+    let mode_opt: OptionSpec = schema.make_option(token.pack8(109, 111, 100, 101, 0, 0, 0, 0), 4, OptionKind.Value, true);
+    let no: OptionSpec = schema.empty_option();
+    return schema.make_command(42, token.pack8(116, 0, 0, 0, 0, 0, 0, 0), 1, token.pack8(116, 101, 115, 116, 0, 0, 0, 0), token.pack8(0, 0, 0, 0, 0, 0, 0, 0), token.pack8(0, 0, 0, 0, 0, 0, 0, 0), 4, format_opt, verbose_opt, mode_opt, 3, false, token.pack8(99, 108, 105, 0, 0, 0, 0, 0), 3);
+}
+
+fn args_of(a: Token, b: Token, c: Token, count: u64) -> (result: [Token; 8]) {
+    let e: Token = token.empty_token();
+    return [a, b, c, e, e, e, e, e];
+}
+
+// --- tokens ---
+
+test long_flag_shape() -> (result: TestResult) {
+    let flag: [byte; up_to 1024] = [45, 45, 102, 111, 114, 109, 97, 116];
+    let bare: [byte; up_to 1024] = [102, 111, 114, 109, 97, 116];
+    let short: [byte; up_to 1024] = [45, 102];
+    let tiny: [byte; up_to 1024] = [45, 45];
+    let is_flag: bool = token.is_long_flag(dash_token(flag, 8));
+    let not_bare: bool = token.is_long_flag(dash_token(bare, 6)) == false;
+    let not_short: bool = token.is_long_flag(dash_token(short, 2)) == false;
+    let not_tiny: bool = token.is_long_flag(dash_token(tiny, 2)) == false;
+    return from_assertion(equals_bool(true, is_flag && not_bare && not_short && not_tiny, 4001));
+}
+
+test assignment_shape() -> (result: TestResult) {
+    let attached: [byte; up_to 1024] = [45, 45, 102, 61, 106];
+    let plain: [byte; up_to 1024] = [45, 45, 102, 111, 114];
+    let yes: bool = token.is_long_assignment(dash_token(attached, 5));
+    let no: bool = token.is_long_assignment(dash_token(plain, 5)) == false;
+    return from_assertion(equals_bool(true, yes && no, 4002));
+}
+
+test split_assignment_halves() -> (result: TestResult) {
+    let raw: [byte; up_to 1024] = [45, 45, 102, 61, 106, 115, 111, 110];
+    let parts: NameValue = token.split_assignment(dash_token(raw, 8));
+    let pname: Token = parts.name;
+    let pvalue: Token = parts.value;
+    let name_ok: bool = pname.len == 3 && pname.bytes[2] == 102;
+    let value_ok: bool = parts.has_value && pvalue.len == 4 && pvalue.bytes[0] == 106;
+    return from_assertion(equals_bool(true, name_ok && value_ok, 4003));
+}
+
+test split_without_value() -> (result: TestResult) {
+    let raw: [byte; up_to 1024] = [45, 45, 102, 111, 114];
+    let parts: NameValue = token.split_assignment(dash_token(raw, 5));
+    let pname: Token = parts.name;
+    return from_assertion(equals_bool(true, parts.has_value == false && pname.len == 5, 4004));
+}
+
+test strip_dashes_bare() -> (result: TestResult) {
+    let raw: [byte; up_to 1024] = [45, 45, 102, 111, 114, 109, 97, 116];
+    let bare: Token = token.strip_dashes(dash_token(raw, 8));
+    let want_raw: [byte; up_to 1024] = [102, 111, 114, 109, 97, 116];
+    let want: Token = token.from_entry(want_raw, 6);
+    return from_assertion(equals_bool(true, token.token_eq(bare, want), 4005));
+}
+
+test from_entry_small() -> (result: TestResult) {
+    let raw: [byte; up_to 1024] = [104, 105];
+    let tok: Token = token.from_entry(raw, 2);
+    return from_assertion(equals_bool(true, tok.len == 2 && tok.truncated == false && tok.bytes[0] == 104 && tok.bytes[1] == 105, 4006));
+}
+
+test from_entry_truncated() -> (result: TestResult) {
+    let big: [byte; up_to 1024] = [7; 1024];
+    let tok: Token = token.from_entry(big, 100);
+    return from_assertion(equals_bool(true, tok.truncated && tok.len == 64 && tok.bytes[63] == 7, 4007));
+}
+
+test name_matches_exact() -> (result: TestResult) {
+    let raw: [byte; up_to 1024] = [102, 111, 114, 109, 97, 116];
+    let tok: Token = token.from_entry(raw, 6);
+    let spelling: [byte; 32] = schema.pad32(token.pack8(102, 111, 114, 109, 97, 116, 0, 0), 6);
+    let yes: bool = token.name_matches(tok, spelling, 6);
+    let wrong_len: bool = token.name_matches(tok, spelling, 5) == false;
+    let other: [byte; 32] = schema.pad32(token.pack8(102, 111, 114, 109, 97, 120, 0, 0), 6);
+    let no: bool = token.name_matches(tok, other, 6) == false;
+    return from_assertion(equals_bool(true, yes && wrong_len && no, 4008));
+}
+
+test token_eq_values() -> (result: TestResult) {
+    let left: Token = entry3(104, 105, 33);
+    let same: Token = entry3(104, 105, 33);
+    let diff: Token = entry3(104, 105, 34);
+    return from_assertion(equals_bool(true, token.token_eq(left, same) && token.token_eq(left, diff) == false, 4009));
+}
+
+// --- descriptors ---
+
+test find_option_hits() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let f_raw: [byte; up_to 1024] = [102, 111, 114, 109, 97, 116];
+    let v_raw: [byte; up_to 1024] = [118, 101, 114, 98, 111, 115, 101];
+    let b_raw: [byte; up_to 1024] = [98, 111, 103, 117, 115];
+    let f: OptionHit = schema.find_option(spec, token.from_entry(f_raw, 6));
+    let v: OptionHit = schema.find_option(spec, token.from_entry(v_raw, 7));
+    let b: OptionHit = schema.find_option(spec, token.from_entry(b_raw, 5));
+    let ok: bool = f.found && f.index == 0 && v.found && v.index == 1 && b.found == false;
+    return from_assertion(equals_bool(true, ok, 4010));
+}
+
+test required_check() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let partial: [bool; 8] = [true, false, false, false, false, false, false, false];
+    let full: [bool; 8] = [false, true, true, false, false, false, false, false];
+    let missing: bool = schema.required_satisfied(spec, partial) == false;
+    let satisfied: bool = schema.required_satisfied(spec, full);
+    let first: u64 = schema.first_missing_required(spec, partial);
+    return from_assertion(equals_bool(true, missing && satisfied && first == 2, 4011));
+}
+
+// --- parsing ---
+
+test parse_flag_and_separate_value() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let a_raw: [byte; up_to 1024] = [45, 45, 118, 101, 114, 98, 111, 115, 101];
+    let b_raw: [byte; up_to 1024] = [45, 45, 109, 111, 100, 101];
+    let c_raw: [byte; up_to 1024] = [106, 115, 111, 110];
+    let d_raw: [byte; up_to 1024] = [45, 45, 102, 111, 114, 109, 97, 116];
+    let parsed: ParseResult = parse.parse_args(spec, args_of(token.from_entry(a_raw, 9), token.from_entry(b_raw, 6), token.from_entry(c_raw, 4), 3), 3);
+    let parsed2: ParseResult = parse.parse_args(spec, args_of(token.from_entry(d_raw, 8), token.from_entry(c_raw, 4), token.from_entry(b_raw, 6), 3), 3);
+    let verbose_item: ParsedValue = parsed.values[0];
+    let first_ok: bool = parsed.ok && parsed.value_count == 2 && verbose_item.option_index == 1 && verbose_item.has_value == false;
+    let mode_ok: bool = parsed2.ok == false && parse.error_code(parsed2.error) == 2;
+    return from_assertion(equals_bool(true, first_ok && mode_ok, 4012));
+}
+
+test parse_attached_value() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let a_raw: [byte; up_to 1024] = [45, 45, 109, 111, 100, 101, 61, 120];
+    let parsed: ParseResult = parse.parse_args(spec, args_of(token.from_entry(a_raw, 8), token.empty_token(), token.empty_token(), 1), 1);
+    let item: ParsedValue = parsed.values[0];
+    let ival: Token = item.value;
+    let ok: bool = parsed.ok && parsed.value_count == 1 && item.option_index == 2 && item.has_value && ival.len == 1 && ival.bytes[0] == 120;
+    return from_assertion(equals_bool(true, ok, 4013));
+}
+
+test parse_unknown_option() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let a_raw: [byte; up_to 1024] = [45, 45, 98, 111, 103, 117, 115];
+    let parsed: ParseResult = parse.parse_args(spec, args_of(token.from_entry(a_raw, 7), token.empty_token(), token.empty_token(), 1), 1);
+    return from_assertion(equals_bool(true, parsed.ok == false && parse.error_code(parsed.error) == 1, 4014));
+}
+
+test parse_missing_value() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let a_raw: [byte; up_to 1024] = [45, 45, 102, 111, 114, 109, 97, 116];
+    let parsed: ParseResult = parse.parse_args(spec, args_of(token.from_entry(a_raw, 8), token.empty_token(), token.empty_token(), 1), 1);
+    return from_assertion(equals_bool(true, parsed.ok == false && parse.error_code(parsed.error) == 2 && parsed.error_index == 0, 4015));
+}
+
+test parse_missing_required() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let a_raw: [byte; up_to 1024] = [45, 45, 118, 101, 114, 98, 111, 115, 101];
+    let parsed: ParseResult = parse.parse_args(spec, args_of(token.from_entry(a_raw, 9), token.empty_token(), token.empty_token(), 1), 1);
+    return from_assertion(equals_bool(true, parsed.ok == false && parse.error_code(parsed.error) == 3 && parsed.error_index == 2, 4016));
+}
+
+test parse_flag_with_value() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let a_raw: [byte; up_to 1024] = [45, 45, 118, 101, 114, 98, 111, 115, 101, 61, 120];
+    let parsed: ParseResult = parse.parse_args(spec, args_of(token.from_entry(a_raw, 11), token.empty_token(), token.empty_token(), 1), 1);
+    return from_assertion(equals_bool(true, parsed.ok == false && parse.error_code(parsed.error) == 4, 4017));
+}
+
+test parse_positional_collected() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let a_raw: [byte; up_to 1024] = [45, 45, 109, 111, 100, 101];
+    let b_raw: [byte; up_to 1024] = [120];
+    let c_raw: [byte; up_to 1024] = [112, 111, 115];
+    let parsed: ParseResult = parse.parse_args(spec, args_of(token.from_entry(a_raw, 6), token.from_entry(b_raw, 1), token.from_entry(c_raw, 3), 3), 3);
+    let pos: Token = parsed.positionals[0];
+    let ok: bool = parsed.ok && parsed.positional_count == 1 && pos.len == 3 && pos.bytes[0] == 112;
+    return from_assertion(equals_bool(true, ok, 4018));
+}
+
+test parse_truncated_token() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let big: [byte; up_to 1024] = [45; 1024];
+    let parsed: ParseResult = parse.parse_args(spec, args_of(token.from_entry(big, 100), token.empty_token(), token.empty_token(), 1), 1);
+    return from_assertion(equals_bool(true, parsed.ok == false && parse.error_code(parsed.error) == 6, 4019));
+}
+
+test parse_value_consumes_flaglike() -> (result: TestResult) {
+    let spec: CommandSpec = parse_spec();
+    let a_raw: [byte; up_to 1024] = [45, 45, 102, 111, 114, 109, 97, 116];
+    let b_raw: [byte; up_to 1024] = [45, 45, 106, 115, 111, 110];
+    let c_raw: [byte; up_to 1024] = [45, 45, 109, 111, 100, 101];
+    let d_raw: [byte; up_to 1024] = [120];
+    let args: [Token; 8] = args_of(token.from_entry(a_raw, 8), token.from_entry(b_raw, 6), token.from_entry(c_raw, 6), 3);
+    let e: Token = token.empty_token();
+    let full: [Token; 8] = [args[0], args[1], token.from_entry(c_raw, 6), token.from_entry(d_raw, 1), e, e, e, e];
+    let parsed: ParseResult = parse.parse_args(spec, full, 4);
+    let item: ParsedValue = parsed.values[0];
+    let ival: Token = item.value;
+    let kept: bool = parsed.ok && ival.len == 6 && ival.bytes[0] == 45 && ival.bytes[2] == 106;
+    return from_assertion(equals_bool(true, kept, 4020));
+}
+
+// --- rendering ---
+
+test render_put_grows() -> (result: TestResult) {
+    let buf: OutBuf = render.put(render.open(), 65);
+    return from_assertion(equals_bool(true, buf.ok && buf.len == 1 && buf.bytes[0] == 65, 4021));
+}
+
+test render_u64_values() -> (result: TestResult) {
+    let zero: OutBuf = render.put_u64(render.open(), 0);
+    let small: OutBuf = render.put_u64(render.open(), 42);
+    let big: OutBuf = render.put_u64(render.open(), 1000);
+    let ok_zero: bool = zero.len == 1 && zero.bytes[0] == 48;
+    let ok_small: bool = small.len == 2 && small.bytes[0] == 52 && small.bytes[1] == 50;
+    let ok_big: bool = big.len == 4 && big.bytes[0] == 49 && big.bytes[3] == 48;
+    return from_assertion(equals_bool(true, ok_zero && ok_small && ok_big, 4022));
+}
+
+test render_overflow_poisons() -> (result: TestResult) {
+    let ticks: [byte; 16] = [0; 16];
+    let chunk: [byte; 64] = [65; 64];
+    iterate i over ticks carrying buf: OutBuf = render.open() {
+        next buf = render.put_bytes(buf, chunk, 64);
+    }
+    let extra: OutBuf = render.put(buf, 66);
+    return from_assertion(equals_bool(true, buf.ok && buf.len == 1024 && extra.ok == false && extra.len == 1024, 4023));
+}
+
+test render_key_shape() -> (result: TestResult) {
+    let buf: OutBuf = render.put(render.open(), 123);
+    return from_assertion(equals_bool(true, buf.len == 1 && buf.bytes[0] == 123, 4024));
+}
+
+test render_finish_prefix() -> (result: TestResult) {
+    let step0: OutBuf = render.put(render.open(), 104);
+    let step1: OutBuf = render.put(step0, 105);
+    let view: [byte; up_to 1024] = render.finish(step1);
+    return from_assertion(equals_bool(true, view[0] == 104 && view[1] == 105 && render.finished_len(step1) == 2, 4025));
+}
+
+// --- outcomes ---
+
+test outcome_exit_codes() -> (result: TestResult) {
+    let s: bool = outcome.exit_code(ExitClass.Success) == 0;
+    let f: bool = outcome.exit_code(ExitClass.SemanticFail) == 1;
+    let u: bool = outcome.exit_code(ExitClass.Incomplete) == 2;
+    let g: bool = outcome.exit_code(ExitClass.Usage) == 64;
+    let v: bool = outcome.exit_code(ExitClass.Unavailable) == 69;
+    let n: bool = outcome.exit_code(ExitClass.Internal) == 70;
+    return from_assertion(equals_bool(true, s && f && u && g && v && n, 4026));
+}
+
+test outcome_projections() -> (result: TestResult) {
+    let po: bool = outcome.outcome_code(Outcome.Pass) == 0;
+    let fo: bool = outcome.outcome_code(Outcome.Fail) == 1;
+    let uo: bool = outcome.outcome_code(Outcome.Unknown) == 2;
+    let sc: bool = outcome.class_code(ExitClass.Success) == 0;
+    let uc: bool = outcome.class_code(ExitClass.Usage) == 3;
+    let nc: bool = outcome.class_code(ExitClass.Internal) == 5;
+    return from_assertion(equals_bool(true, po && fo && uo && sc && uc && nc, 4027));
+}
+
+test complete_preserves_fail() -> (result: TestResult) {
+    let data: [byte; up_to 1024] = [];
+    let diag: [byte; up_to 1024] = [];
+    let done: CommandExit = outcome.complete(Outcome.Fail, data, diag);
+    let fin: ApplicationExit = done.exit;
+    let ok: bool = done.has_outcome && outcome.outcome_code(done.outcome) == 1 && fin.exit_code == 1;
+    let cls: bool = outcome.class_code(done.class) == 1;
+    return from_assertion(equals_bool(true, ok && cls, 4028));
+}
+
+test complete_preserves_unknown() -> (result: TestResult) {
+    let data: [byte; up_to 1024] = [];
+    let diag: [byte; up_to 1024] = [];
+    let done: CommandExit = outcome.complete(Outcome.Unknown, data, diag);
+    let fin: ApplicationExit = done.exit;
+    let ok: bool = done.has_outcome && outcome.outcome_code(done.outcome) == 2 && fin.exit_code == 2;
+    return from_assertion(equals_bool(true, ok, 4029));
+}
+
+test usage_has_no_outcome() -> (result: TestResult) {
+    let data: [byte; up_to 1024] = render.finish(render.open());
+    let diag: [byte; up_to 1024] = render.finish(render.put(render.open(), 117));
+    let done: CommandExit = outcome.fail_usage(data, diag);
+    let fin: ApplicationExit = done.exit;
+    let split: bool = fin.stdout[0] == 0 && fin.stderr[0] == 117;
+    return from_assertion(equals_bool(true, done.has_outcome == false && fin.exit_code == 64 && split, 4030));
+}

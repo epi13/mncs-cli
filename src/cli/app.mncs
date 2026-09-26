@@ -1,0 +1,860 @@
+mncs 0.18;
+
+// mncs.cli.app.v1 — the reference command tree and dispatcher.
+//
+// This module answers the architectural question directly: the CLI owns
+// command parsing (against descriptors), argument validation, identity
+// resolution to canonical spellings, routing, formatting, and exit-code
+// mapping. It does NOT own execution policy, test semantics, diagnosis,
+// persistence, or orchestration: `forge`, `test`, `debug`, and `doctor`
+// are delegated descriptors. Dispatching one returns a delegation record
+// with Outcome Unknown — the CLI reports where the request routes and
+// refuses to pretend it executed.
+//
+// Command tree (codes are stable identities):
+//   1 help      human help for one command, or the command index
+//   2 schema    machine-readable JSON descriptor for one command
+//   3 version   machine-readable CLI identity
+//   4 verdict   project a canonical outcome word to JSON plus exit code
+//   5 forge     delegate an action to Forge (never executes here)
+//   6 test      delegate a test action to mncs-test (never executes here)
+//   7 debug     delegate a diagnosis query to Debug (never executes here)
+//   8 doctor    delegate a check scope to Doctor (never executes here)
+//   9 commands  list command names (human)
+//
+// Without string literals every spelling is an explicit numeric byte
+// array with a comment giving the intended text (pressure P-CLI-002).
+
+module mncs.cli.app.v1;
+
+use mncs.cli.token.v1 as token;
+use mncs.cli.schema.v1 as schema;
+use mncs.cli.parse.v1 as parse;
+use mncs.cli.render.v1 as render;
+use mncs.cli.outcome.v1 as outcome;
+
+record HandlerOut {
+    has_outcome: bool,
+    result: Outcome,
+    class: ExitClass,
+    stdout: OutBuf,
+    stderr: OutBuf
+}
+
+record FoundValue {
+    found: bool,
+    has_value: bool,
+    value: Token
+}
+
+// --- spelling chunks ("text" as explicit bytes) ---
+
+// "help"
+fn w_help() -> (result: [byte; 8]) {
+    return token.pack8(104, 101, 108, 112, 0, 0, 0, 0);
+}
+
+// "schema"
+fn w_schema() -> (result: [byte; 8]) {
+    return token.pack8(115, 99, 104, 101, 109, 97, 0, 0);
+}
+
+// "version"
+fn w_version() -> (result: [byte; 8]) {
+    return token.pack8(118, 101, 114, 115, 105, 111, 110, 0);
+}
+
+// "verdict"
+fn w_verdict() -> (result: [byte; 8]) {
+    return token.pack8(118, 101, 114, 100, 105, 99, 116, 0);
+}
+
+// "check"
+fn w_check() -> (result: [byte; 8]) {
+    return token.pack8(99, 104, 101, 99, 107, 0, 0, 0);
+}
+
+// "commands"
+fn w_commands() -> (result: [byte; 8]) {
+    return token.pack8(99, 111, 109, 109, 97, 110, 100, 115);
+}
+
+// "command"
+fn w_command() -> (result: [byte; 8]) {
+    return token.pack8(99, 111, 109, 109, 97, 110, 100, 0);
+}
+
+// "outcome"
+fn w_outcome() -> (result: [byte; 8]) {
+    return token.pack8(111, 117, 116, 99, 111, 109, 101, 0);
+}
+
+// "owner"
+fn w_owner() -> (result: [byte; 8]) {
+    return token.pack8(111, 119, 110, 101, 114, 0, 0, 0);
+}
+
+// "action"
+fn w_action() -> (result: [byte; 8]) {
+    return token.pack8(97, 99, 116, 105, 111, 110, 0, 0);
+}
+
+// "target"
+fn w_target() -> (result: [byte; 8]) {
+    return token.pack8(116, 97, 114, 103, 101, 116, 0, 0);
+}
+
+// "cli"
+fn w_cli() -> (result: [byte; 8]) {
+    return token.pack8(99, 108, 105, 0, 0, 0, 0, 0);
+}
+
+// "forge"
+fn w_forge() -> (result: [byte; 8]) {
+    return token.pack8(102, 111, 114, 103, 101, 0, 0, 0);
+}
+
+// "test"
+fn w_test() -> (result: [byte; 8]) {
+    return token.pack8(116, 101, 115, 116, 0, 0, 0, 0);
+}
+
+// "debug"
+fn w_debug() -> (result: [byte; 8]) {
+    return token.pack8(100, 101, 98, 117, 103, 0, 0, 0);
+}
+
+// "doctor"
+fn w_doctor() -> (result: [byte; 8]) {
+    return token.pack8(100, 111, 99, 116, 111, 114, 0, 0);
+}
+
+// "pass" / "fail" / "unknown"
+fn w_pass() -> (result: [byte; 8]) {
+    return token.pack8(112, 97, 115, 115, 0, 0, 0, 0);
+}
+
+fn w_fail() -> (result: [byte; 8]) {
+    return token.pack8(102, 97, 105, 108, 0, 0, 0, 0);
+}
+
+fn w_unknown() -> (result: [byte; 8]) {
+    return token.pack8(117, 110, 107, 110, 111, 119, 110, 0);
+}
+
+// --- descriptors ---
+
+fn opt_command() -> (result: OptionSpec) {
+    return schema.make_option(w_command(), 7, OptionKind.Value, false);
+}
+
+fn opt_command_required() -> (result: OptionSpec) {
+    return schema.make_option(w_command(), 7, OptionKind.Value, true);
+}
+
+fn opt_outcome() -> (result: OptionSpec) {
+    return schema.make_option(w_outcome(), 7, OptionKind.Value, true);
+}
+
+fn opt_action() -> (result: OptionSpec) {
+    return schema.make_option(w_action(), 6, OptionKind.Value, true);
+}
+
+fn opt_target() -> (result: OptionSpec) {
+    return schema.make_option(w_target(), 6, OptionKind.Value, false);
+}
+
+fn no_owner() -> (result: [byte; 8]) {
+    return token.pack8(0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// "show command help" (17)
+fn sum_help0() -> (result: [byte; 8]) {
+    return token.pack8(115, 104, 111, 119, 32, 99, 111, 109);
+}
+
+fn sum_help1() -> (result: [byte; 8]) {
+    return token.pack8(109, 97, 110, 100, 32, 104, 101, 108);
+}
+
+fn sum_help2() -> (result: [byte; 8]) {
+    return token.pack8(112, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// "emit command schema" (19)
+fn sum_schema0() -> (result: [byte; 8]) {
+    return token.pack8(101, 109, 105, 116, 32, 99, 111, 109);
+}
+
+fn sum_schema1() -> (result: [byte; 8]) {
+    return token.pack8(109, 97, 110, 100, 32, 115, 99, 104);
+}
+
+fn sum_schema2() -> (result: [byte; 8]) {
+    return token.pack8(101, 109, 97, 0, 0, 0, 0, 0);
+}
+
+// "show cli version" (16)
+fn sum_version0() -> (result: [byte; 8]) {
+    return token.pack8(115, 104, 111, 119, 32, 99, 108, 105);
+}
+
+fn sum_version1() -> (result: [byte; 8]) {
+    return token.pack8(32, 118, 101, 114, 115, 105, 111, 110);
+}
+
+// "map outcome to exit" (19)
+fn sum_verdict0() -> (result: [byte; 8]) {
+    return token.pack8(109, 97, 112, 32, 111, 117, 116, 99);
+}
+
+fn sum_verdict1() -> (result: [byte; 8]) {
+    return token.pack8(111, 109, 101, 32, 116, 111, 32, 101);
+}
+
+fn sum_verdict2() -> (result: [byte; 8]) {
+    return token.pack8(120, 105, 116, 0, 0, 0, 0, 0);
+}
+
+// "route to subsystem" (19)
+fn sum_delegate0() -> (result: [byte; 8]) {
+    return token.pack8(114, 111, 117, 116, 101, 32, 116, 111);
+}
+
+fn sum_delegate1() -> (result: [byte; 8]) {
+    return token.pack8(32, 115, 117, 98, 115, 121, 115, 116);
+}
+
+fn sum_delegate2() -> (result: [byte; 8]) {
+    return token.pack8(101, 109, 0, 0, 0, 0, 0, 0);
+}
+
+// "list command names" (18)
+fn sum_commands0() -> (result: [byte; 8]) {
+    return token.pack8(108, 105, 115, 116, 32, 99, 111, 109);
+}
+
+fn sum_commands1() -> (result: [byte; 8]) {
+    return token.pack8(109, 97, 110, 100, 32, 110, 97, 109);
+}
+
+fn sum_commands2() -> (result: [byte; 8]) {
+    return token.pack8(101, 115, 0, 0, 0, 0, 0, 0);
+}
+
+fn command_table() -> (result: [CommandSpec; 9]) {
+    let no: OptionSpec = schema.empty_option();
+    let help_cmd: CommandSpec = schema.make_command(1, w_help(), 4, sum_help0(), sum_help1(), sum_help2(), 17, opt_command(), no, no, 1, false, w_cli(), 3);
+    let schema_cmd: CommandSpec = schema.make_command(2, w_schema(), 6, sum_schema0(), sum_schema1(), sum_schema2(), 19, opt_command_required(), no, no, 1, false, w_cli(), 3);
+    let version_cmd: CommandSpec = schema.make_command(3, w_version(), 7, sum_version0(), sum_version1(), sum_version1(), 16, no, no, no, 0, false, w_cli(), 3);
+    let verdict_cmd: CommandSpec = schema.make_command(4, w_verdict(), 7, sum_verdict0(), sum_verdict1(), sum_verdict2(), 19, opt_outcome(), no, no, 1, false, w_cli(), 3);
+    let forge_cmd: CommandSpec = schema.make_command(5, w_forge(), 5, sum_delegate0(), sum_delegate1(), sum_delegate2(), 19, opt_action(), opt_target(), no, 2, true, w_forge(), 5);
+    let test_cmd: CommandSpec = schema.make_command(6, w_test(), 4, sum_delegate0(), sum_delegate1(), sum_delegate2(), 19, opt_action(), opt_target(), no, 2, true, w_test(), 4);
+    let debug_cmd: CommandSpec = schema.make_command(7, w_debug(), 5, sum_delegate0(), sum_delegate1(), sum_delegate2(), 19, opt_action(), opt_target(), no, 2, true, w_debug(), 5);
+    let doctor_cmd: CommandSpec = schema.make_command(8, w_doctor(), 6, sum_delegate0(), sum_delegate1(), sum_delegate2(), 19, opt_action(), opt_target(), no, 2, true, w_doctor(), 6);
+    let commands_cmd: CommandSpec = schema.make_command(9, w_commands(), 8, sum_commands0(), sum_commands1(), sum_commands2(), 18, no, no, no, 0, false, w_cli(), 3);
+    return [help_cmd, schema_cmd, version_cmd, verdict_cmd, forge_cmd, test_cmd, debug_cmd, doctor_cmd, commands_cmd];
+}
+
+// --- outcome words and value lookup ---
+
+record WordOutcome {
+    known: bool,
+    result: Outcome
+}
+
+fn outcome_for_word(value: Token) -> (result: WordOutcome) {
+    if token.name_matches(value, schema.pad32(w_pass(), 4), 4) {
+        return WordOutcome { known: true, result: Outcome.Pass };
+    }
+    if token.name_matches(value, schema.pad32(w_fail(), 4), 4) {
+        return WordOutcome { known: true, result: Outcome.Fail };
+    }
+    if token.name_matches(value, schema.pad32(w_unknown(), 7), 7) {
+        return WordOutcome { known: true, result: Outcome.Unknown };
+    }
+    return WordOutcome { known: false, result: Outcome.Unknown };
+}
+
+fn outcome_word(result: Outcome) -> (result: [byte; 8]) {
+    return match result {
+        Outcome.Pass => w_pass(),
+        Outcome.Fail => w_fail(),
+        Outcome.Unknown => w_unknown(),
+    };
+}
+
+fn outcome_word_len(result: Outcome) -> (result: u64) {
+    return match result {
+        Outcome.Pass => 4,
+        Outcome.Fail => 4,
+        Outcome.Unknown => 7,
+    };
+}
+
+fn find_value(parsed: ParseResult, option_index: u64) -> (result: FoundValue) {
+    let vals: [ParsedValue; 8] = parsed.values;
+    iterate i over vals carrying hit: FoundValue = FoundValue { found: false, has_value: false, value: token.empty_token() } {
+        let item: ParsedValue = vals[i];
+        let is_match: bool = item.option_index == option_index;
+        next hit = select(is_match, FoundValue { found: true, has_value: item.has_value, value: item.value }, hit);
+    }
+    return hit;
+}
+
+// --- shared presentation words ---
+
+// "summary"
+fn k_summary() -> (result: [byte; 8]) {
+    return token.pack8(115, 117, 109, 109, 97, 114, 121, 0);
+}
+
+// "routing"
+fn k_routing() -> (result: [byte; 8]) {
+    return token.pack8(114, 111, 117, 116, 105, 110, 103, 0);
+}
+
+// "options"
+fn k_options() -> (result: [byte; 8]) {
+    return token.pack8(111, 112, 116, 105, 111, 110, 115, 0);
+}
+
+// "required"
+fn k_required() -> (result: [byte; 8]) {
+    return token.pack8(114, 101, 113, 117, 105, 114, 101, 100);
+}
+
+// "optional"
+fn k_optional() -> (result: [byte; 8]) {
+    return token.pack8(111, 112, 116, 105, 111, 110, 97, 108);
+}
+
+// "flag"
+fn k_flag() -> (result: [byte; 8]) {
+    return token.pack8(102, 108, 97, 103, 0, 0, 0, 0);
+}
+
+// "value"
+fn k_value() -> (result: [byte; 8]) {
+    return token.pack8(118, 97, 108, 117, 101, 0, 0, 0);
+}
+
+// "true"
+fn k_true() -> (result: [byte; 8]) {
+    return token.pack8(116, 114, 117, 101, 0, 0, 0, 0);
+}
+
+// "false"
+fn k_false() -> (result: [byte; 8]) {
+    return token.pack8(102, 97, 108, 115, 101, 0, 0, 0);
+}
+
+// "local"
+fn k_local() -> (result: [byte; 8]) {
+    return token.pack8(108, 111, 99, 97, 108, 0, 0, 0);
+}
+
+// "delegate"
+fn k_delegate() -> (result: [byte; 8]) {
+    return token.pack8(100, 101, 108, 101, 103, 97, 116, 101);
+}
+
+// "name"
+fn k_name() -> (result: [byte; 8]) {
+    return token.pack8(110, 97, 109, 101, 0, 0, 0, 0);
+}
+
+// "kind"
+fn k_kind() -> (result: [byte; 8]) {
+    return token.pack8(107, 105, 110, 100, 0, 0, 0, 0);
+}
+
+// "exit"
+fn k_exit() -> (result: [byte; 8]) {
+    return token.pack8(101, 120, 105, 116, 0, 0, 0, 0);
+}
+
+// "route"
+fn k_route() -> (result: [byte; 8]) {
+    return token.pack8(114, 111, 117, 116, 101, 0, 0, 0);
+}
+
+// "profile"
+fn k_profile() -> (result: [byte; 8]) {
+    return token.pack8(112, 114, 111, 102, 105, 108, 101, 0);
+}
+
+// "mncs-cli"
+fn k_mncs_cli() -> (result: [byte; 8]) {
+    return token.pack8(109, 110, 99, 115, 45, 99, 108, 105);
+}
+
+// "mncs"
+fn k_mncs() -> (result: [byte; 8]) {
+    return token.pack8(109, 110, 99, 115, 0, 0, 0, 0);
+}
+
+// JSON key helper: `"name":` from one chunk plus length.
+fn key8(buf: OutBuf, chunk: [byte; 8], len: u64) -> (result: OutBuf) {
+    return render.put(render.put_quoted_name(buf, schema.pad32(chunk, len), len), 58);
+}
+
+fn bool_word(buf: OutBuf, value: bool) -> (result: OutBuf) {
+    if value {
+        return render.put_chunk8(buf, k_true(), 4);
+    }
+    return render.put_chunk8(buf, k_false(), 5);
+}
+
+// --- human rendering ---
+
+// One index line: `  <name> - <summary>\n`.
+fn index_line(buf: OutBuf, spec: CommandSpec) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(buf, token.pack8(32, 32, 0, 0, 0, 0, 0, 0), 2);
+    let step1: OutBuf = render.put_name(step0, spec.name, spec.name_len);
+    let step2: OutBuf = render.put_chunk8(step1, token.pack8(32, 45, 32, 0, 0, 0, 0, 0), 3);
+    let step3: OutBuf = render.put_bytes(step2, spec.summary, spec.summary_len);
+    return render.newline(step3);
+}
+
+// `mncs - command index\n` plus one line per command.
+fn help_index(table: [CommandSpec; 9]) -> (result: OutBuf) {
+    let head: OutBuf = render.put_chunk8(render.open(), k_mncs(), 4);
+    let head1: OutBuf = render.put_chunk8(head, token.pack8(32, 45, 32, 0, 0, 0, 0, 0), 3);
+    let head2: OutBuf = render.put_chunk8(head1, w_command(), 7);
+    let head3: OutBuf = render.put_chunk8(head2, token.pack8(32, 105, 110, 100, 101, 120, 10, 0), 7);
+    iterate i over table carrying buf: OutBuf = head3 {
+        next buf = index_line(buf, table[i]);
+    }
+    return buf;
+}
+
+// One option line: `  --<name> <flag|value> (required|optional)\n`.
+fn option_line(buf: OutBuf, entry: OptionSpec) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(buf, token.pack8(32, 32, 45, 45, 0, 0, 0, 0), 4);
+    let step1: OutBuf = render.put_name(step0, entry.name, entry.name_len);
+    let step2: OutBuf = render.put_chunk8(step1, token.pack8(32, 60, 0, 0, 0, 0, 0, 0), 2);
+    let step3: OutBuf = select(schema.option_takes_value(entry), render.put_chunk8(step2, k_value(), 5), render.put_chunk8(step2, k_flag(), 4));
+    let step4: OutBuf = render.put_chunk8(step3, token.pack8(62, 32, 40, 0, 0, 0, 0, 0), 3);
+    let step5: OutBuf = select(entry.required, render.put_chunk8(step4, k_required(), 8), render.put_chunk8(step4, k_optional(), 8));
+    let step6: OutBuf = render.put_chunk8(step5, token.pack8(41, 10, 0, 0, 0, 0, 0, 0), 2);
+    return step6;
+}
+
+fn help_for(spec: CommandSpec) -> (result: OutBuf) {
+    let line0: OutBuf = render.put_chunk8(render.open(), k_mncs(), 4);
+    let line1: OutBuf = render.put_chunk8(line0, token.pack8(32, 0, 0, 0, 0, 0, 0, 0), 1);
+    let line2: OutBuf = render.put_name(line1, spec.name, spec.name_len);
+    let line3: OutBuf = render.put_chunk8(line2, token.pack8(32, 45, 32, 0, 0, 0, 0, 0), 3);
+    let line4: OutBuf = render.put_bytes(line3, spec.summary, spec.summary_len);
+    let line5: OutBuf = render.newline(line4);
+    // `usage: mncs <name> [options]\n`
+    let use0: OutBuf = render.put_chunk8(line5, token.pack8(117, 115, 97, 103, 101, 58, 32, 109), 8);
+    let use1: OutBuf = render.put_chunk8(use0, token.pack8(110, 99, 115, 32, 0, 0, 0, 0), 4);
+    let use2: OutBuf = render.put_name(use1, spec.name, spec.name_len);
+    let use3: OutBuf = render.put_chunk8(use2, token.pack8(32, 91, 111, 112, 116, 105, 111, 110), 8);
+    let use4: OutBuf = render.put_chunk8(use3, token.pack8(115, 93, 10, 0, 0, 0, 0, 0), 3);
+    // `options:\n`
+    let opt0: OutBuf = render.put_chunk8(use4, token.pack8(111, 112, 116, 105, 111, 110, 115, 58), 8);
+    let opt1: OutBuf = render.newline(opt0);
+    let opts: [OptionSpec; 8] = spec.options;
+    iterate i over opts carrying buf: OutBuf = opt1 {
+        let live: bool = i < spec.option_count;
+        next buf = select(live, option_line(buf, opts[i]), buf);
+    }
+    if spec.delegated {
+        // `delegated to: <owner>\n`
+        let del0: OutBuf = render.put_chunk8(buf, k_delegate(), 8);
+        let del1: OutBuf = render.put_chunk8(del0, token.pack8(100, 32, 116, 111, 58, 32, 0, 0), 6);
+        let del2: OutBuf = render.put_name(del1, spec.owner, spec.owner_len);
+        return render.newline(del2);
+    }
+    return buf;
+}
+
+// --- machine rendering (compact JSON) ---
+
+fn schema_option_json(buf: OutBuf, entry: OptionSpec, first: bool) -> (result: OutBuf) {
+    let step0: OutBuf = select(first, buf, render.put(buf, 44));
+    let step1: OutBuf = render.put(step0, 123);
+    let step2: OutBuf = key8(step1, k_name(), 4);
+    let step3: OutBuf = render.put_quoted_name(step2, entry.name, entry.name_len);
+    let step4: OutBuf = render.put(step3, 44);
+    let step5: OutBuf = key8(step4, k_kind(), 4);
+    let step6: OutBuf = select(schema.option_takes_value(entry), render.put_quoted_name(step5, schema.pad32(k_value(), 5), 5), render.put_quoted_name(step5, schema.pad32(k_flag(), 4), 4));
+    let step7: OutBuf = render.put(step6, 44);
+    let step8: OutBuf = key8(step7, k_required(), 8);
+    let step9: OutBuf = bool_word(step8, entry.required);
+    return render.put(step9, 125);
+}
+
+fn schema_json(spec: CommandSpec) -> (result: OutBuf) {
+    let step0: OutBuf = render.put(render.open(), 123);
+    let step1: OutBuf = key8(step0, w_command(), 7);
+    let step2: OutBuf = render.put_quoted_name(step1, spec.name, spec.name_len);
+    let step3: OutBuf = render.put(step2, 44);
+    let step4: OutBuf = key8(step3, k_summary(), 7);
+    let step5: OutBuf = render.put(step4, 34);
+    let step6: OutBuf = render.put_bytes(step5, spec.summary, spec.summary_len);
+    let step7: OutBuf = render.put(step6, 34);
+    let step8: OutBuf = render.put(step7, 44);
+    let step9: OutBuf = key8(step8, k_routing(), 7);
+    let step10: OutBuf = select(spec.delegated, render.put_quoted_name(step9, schema.pad32(k_delegate(), 8), 8), render.put_quoted_name(step9, schema.pad32(k_local(), 5), 5));
+    let step11: OutBuf = render.put(step10, 44);
+    let step12: OutBuf = key8(step11, w_owner(), 5);
+    let step13: OutBuf = render.put_quoted_name(step12, spec.owner, spec.owner_len);
+    let step14: OutBuf = render.put(step13, 44);
+    let step15: OutBuf = key8(step14, k_options(), 7);
+    let step16: OutBuf = render.put(step15, 91);
+    let opts: [OptionSpec; 8] = spec.options;
+    iterate i over opts carrying st: OutBuf = step16 {
+        let live: bool = i < spec.option_count;
+        let first: bool = i == 0;
+        next st = select(live, schema_option_json(st, opts[i], first), st);
+    }
+    let done: OutBuf = render.put(st, 93);
+    return render.put(done, 125);
+}
+
+fn version_json() -> (result: OutBuf) {
+    let step0: OutBuf = render.put(render.open(), 123);
+    let step1: OutBuf = key8(step0, k_name(), 4);
+    let step2: OutBuf = render.put_quoted_name(step1, schema.pad32(k_mncs_cli(), 8), 8);
+    let step3: OutBuf = render.put(step2, 44);
+    let step4: OutBuf = key8(step3, w_version(), 7);
+    let step5: OutBuf = render.put(step4, 91);
+    let step6: OutBuf = render.put_u64(step5, 0);
+    let step7: OutBuf = render.put(step6, 44);
+    let step8: OutBuf = render.put_u64(step7, 1);
+    let step9: OutBuf = render.put(step8, 44);
+    let step10: OutBuf = render.put_u64(step9, 0);
+    let step11: OutBuf = render.put(step10, 93);
+    let step12: OutBuf = render.put(step11, 44);
+    let step13: OutBuf = key8(step12, k_profile(), 7);
+    let step14: OutBuf = render.put_u64(step13, 18);
+    return render.put(step14, 125);
+}
+
+fn verdict_json(result: Outcome, code: i64) -> (result: OutBuf) {
+    let step0: OutBuf = render.put(render.open(), 123);
+    let step1: OutBuf = key8(step0, w_command(), 7);
+    let step2: OutBuf = render.put_quoted_name(step1, schema.pad32(w_verdict(), 7), 7);
+    let step3: OutBuf = render.put(step2, 44);
+    let step4: OutBuf = key8(step3, w_outcome(), 7);
+    let step5: OutBuf = render.put_quoted_name(step4, schema.pad32(outcome_word(result), outcome_word_len(result)), outcome_word_len(result));
+    let step6: OutBuf = render.put(step5, 44);
+    let step7: OutBuf = key8(step6, k_exit(), 4);
+    let step8: OutBuf = render.put_u64(step7, code as u64);
+    return render.put(step8, 125);
+}
+
+fn delegation_json(spec: CommandSpec, action: Token, has_target: bool, target: Token) -> (result: OutBuf) {
+    let step0: OutBuf = render.put(render.open(), 123);
+    let step1: OutBuf = key8(step0, w_command(), 7);
+    let step2: OutBuf = render.put_quoted_name(step1, spec.name, spec.name_len);
+    let step3: OutBuf = render.put(step2, 44);
+    let step4: OutBuf = key8(step3, k_routing(), 7);
+    let step5: OutBuf = render.put_quoted_name(step4, schema.pad32(k_delegate(), 8), 8);
+    let step6: OutBuf = render.put(step5, 44);
+    let step7: OutBuf = key8(step6, w_owner(), 5);
+    let step8: OutBuf = render.put_quoted_name(step7, spec.owner, spec.owner_len);
+    let step9: OutBuf = render.put(step8, 44);
+    let step10: OutBuf = key8(step9, w_action(), 6);
+    let step11: OutBuf = render.put_quoted_token(step10, action.bytes, action.len);
+    let step12: OutBuf = render.put(step11, 44);
+    let step13: OutBuf = key8(step12, w_target(), 6);
+    let step14: OutBuf = select(has_target, render.put_quoted_token(step13, target.bytes, target.len), render.put_chunk8(step13, token.pack8(110, 117, 108, 108, 0, 0, 0, 0), 4));
+    let step15: OutBuf = render.put(step14, 44);
+    let step16: OutBuf = key8(step15, w_outcome(), 7);
+    let step17: OutBuf = render.put_quoted_name(step16, schema.pad32(w_unknown(), 7), 7);
+    let step18: OutBuf = render.put(step17, 44);
+    let step19: OutBuf = key8(step18, k_route(), 5);
+    let step20: OutBuf = render.put_name(step19, spec.owner, spec.owner_len);
+    let step21: OutBuf = render.put_chunk8(step20, token.pack8(46, 0, 0, 0, 0, 0, 0, 0), 1);
+    let step22: OutBuf = render.put_bytes(step21, action.bytes, action.len);
+    return render.put(step22, 125);
+}
+
+// --- diagnostics (stderr side only; data never mixes into stdout) ---
+
+// `unknown command: <token>\n`
+fn stderr_unknown_command(bad: Token) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), w_unknown(), 7);
+    let step1: OutBuf = render.put_chunk8(step0, token.pack8(32, 99, 111, 109, 109, 97, 110, 100), 8);
+    let step2: OutBuf = render.put_chunk8(step1, token.pack8(58, 32, 0, 0, 0, 0, 0, 0), 2);
+    let step3: OutBuf = render.put_bytes(step2, bad.bytes, bad.len);
+    return render.newline(step3);
+}
+
+// `unknown option: <token>\n`
+fn stderr_unknown_option(bad: Token) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), w_unknown(), 7);
+    let step1: OutBuf = render.put_chunk8(step0, token.pack8(32, 111, 112, 116, 105, 111, 110, 58), 8);
+    let step2: OutBuf = render.put_chunk8(step1, token.pack8(32, 0, 0, 0, 0, 0, 0, 0), 1);
+    let step3: OutBuf = render.put_bytes(step2, bad.bytes, bad.len);
+    return render.newline(step3);
+}
+
+// `unknown outcome: <token>\n`
+fn stderr_unknown_outcome(bad: Token) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), w_unknown(), 7);
+    let step1: OutBuf = render.put_chunk8(step0, token.pack8(32, 111, 117, 116, 99, 111, 109, 101), 8);
+    let step2: OutBuf = render.put_chunk8(step1, token.pack8(58, 32, 0, 0, 0, 0, 0, 0), 2);
+    let step3: OutBuf = render.put_bytes(step2, bad.bytes, bad.len);
+    return render.newline(step3);
+}
+
+// `missing value: <option>\n`
+fn stderr_missing_value(name: [byte; 32], name_len: u64) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), token.pack8(109, 105, 115, 115, 105, 110, 103, 32), 8);
+    let step1: OutBuf = render.put_chunk8(step0, k_value(), 5);
+    let step2: OutBuf = render.put_chunk8(step1, token.pack8(58, 32, 0, 0, 0, 0, 0, 0), 2);
+    let step3: OutBuf = render.put_name(step2, name, name_len);
+    return render.newline(step3);
+}
+
+// `missing required: <option>\n`
+fn stderr_missing_required(name: [byte; 32], name_len: u64) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), token.pack8(109, 105, 115, 115, 105, 110, 103, 32), 8);
+    let step1: OutBuf = render.put_chunk8(step0, k_required(), 8);
+    let step2: OutBuf = render.put_chunk8(step1, token.pack8(58, 32, 0, 0, 0, 0, 0, 0), 2);
+    let step3: OutBuf = render.put_name(step2, name, name_len);
+    return render.newline(step3);
+}
+
+// `bad value: <token>\n`
+fn stderr_bad_value(bad: Token) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), token.pack8(98, 97, 100, 32, 118, 97, 108, 117), 8);
+    let step1: OutBuf = render.put_chunk8(step0, token.pack8(101, 58, 32, 0, 0, 0, 0, 0), 3);
+    let step2: OutBuf = render.put_bytes(step1, bad.bytes, bad.len);
+    return render.newline(step2);
+}
+
+// `extra input: <token>\n`
+fn stderr_extra_input(bad: Token) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), token.pack8(101, 120, 116, 114, 97, 32, 105, 110), 8);
+    let step1: OutBuf = render.put_chunk8(step0, token.pack8(112, 117, 116, 58, 32, 0, 0, 0), 5);
+    let step2: OutBuf = render.put_bytes(step1, bad.bytes, bad.len);
+    return render.newline(step2);
+}
+
+// `token too long\n`
+fn stderr_token_too_long() -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), token.pack8(116, 111, 107, 101, 110, 32, 116, 111), 8);
+    return render.put_chunk8(step0, token.pack8(111, 32, 108, 111, 110, 103, 10, 0), 7);
+}
+
+// `delegate to <owner>\n`
+fn stderr_delegate_hint(owner: [byte; 32], owner_len: u64) -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), k_delegate(), 8);
+    let step1: OutBuf = render.put_chunk8(step0, token.pack8(32, 116, 111, 32, 0, 0, 0, 0), 4);
+    let step2: OutBuf = render.put_name(step1, owner, owner_len);
+    return render.newline(step2);
+}
+
+// `bad command\n`
+fn stderr_bad_command() -> (result: OutBuf) {
+    let step0: OutBuf = render.put_chunk8(render.open(), token.pack8(98, 97, 100, 32, 99, 111, 109, 109), 8);
+    return render.put_chunk8(step0, token.pack8(97, 110, 100, 10, 0, 0, 0, 0), 4);
+}
+
+// --- handler outcomes ---
+
+fn ok_text(body: OutBuf) -> (result: HandlerOut) {
+    return HandlerOut {
+        has_outcome: true,
+        result: Outcome.Pass,
+        class: ExitClass.Success,
+        stdout: body,
+        stderr: render.open()
+    };
+}
+
+fn usage_text(note: OutBuf) -> (result: HandlerOut) {
+    return HandlerOut {
+        has_outcome: false,
+        result: Outcome.Unknown,
+        class: ExitClass.Usage,
+        stdout: render.open(),
+        stderr: note
+    };
+}
+
+fn to_exit(h: HandlerOut) -> (result: CommandExit) {
+    let data: [byte; up_to 1024] = render.finish(h.stdout);
+    let diag: [byte; up_to 1024] = render.finish(h.stderr);
+    if h.has_outcome {
+        return outcome.complete(h.result, data, diag);
+    }
+    return match h.class {
+        ExitClass.Usage => outcome.fail_usage(data, diag),
+        ExitClass.Unavailable => outcome.fail_unavailable(data, diag),
+        ExitClass.Internal => outcome.fail_internal(data, diag),
+        ExitClass.Success => outcome.fail_internal(data, diag),
+        ExitClass.SemanticFail => outcome.fail_internal(data, diag),
+        ExitClass.Incomplete => outcome.fail_internal(data, diag),
+    };
+}
+
+// --- handlers ---
+
+fn handle_help(table: [CommandSpec; 9], parsed: ParseResult) -> (result: HandlerOut) {
+    let asked: FoundValue = find_value(parsed, 0);
+    if asked.found && asked.has_value {
+        let hit: CommandHit = schema.find_command(table, asked.value);
+        if hit.found {
+            let slot: u64 = select(hit.index < 9, hit.index, 0);
+            return ok_text(help_for(table[slot]));
+        }
+        return usage_text(stderr_unknown_command(asked.value));
+    }
+    return ok_text(help_index(table));
+}
+
+fn handle_schema(table: [CommandSpec; 9], parsed: ParseResult) -> (result: HandlerOut) {
+    let asked: FoundValue = find_value(parsed, 0);
+    if asked.found && asked.has_value {
+        let hit: CommandHit = schema.find_command(table, asked.value);
+        if hit.found {
+            let slot: u64 = select(hit.index < 9, hit.index, 0);
+            return ok_text(schema_json(table[slot]));
+        }
+        return usage_text(stderr_unknown_command(asked.value));
+    }
+    return usage_text(stderr_missing_required(schema.pad32(w_command(), 7), 7));
+}
+
+fn handle_version() -> (result: HandlerOut) {
+    return ok_text(version_json());
+}
+
+fn handle_verdict(parsed: ParseResult) -> (result: HandlerOut) {
+    let asked: FoundValue = find_value(parsed, 0);
+    if asked.found && asked.has_value {
+        let word: WordOutcome = outcome_for_word(asked.value);
+        if word.known {
+            let class: ExitClass = outcome.class_for_outcome(word.result);
+            return HandlerOut {
+                has_outcome: true,
+                result: word.result,
+                class: class,
+                stdout: verdict_json(word.result, outcome.exit_code(class)),
+                stderr: render.open()
+            };
+        }
+        return usage_text(stderr_unknown_outcome(asked.value));
+    }
+    return usage_text(stderr_missing_required(schema.pad32(w_outcome(), 7), 7));
+}
+
+fn handle_delegate(spec: CommandSpec, parsed: ParseResult) -> (result: HandlerOut) {
+    let action: FoundValue = find_value(parsed, 0);
+    if action.found && action.has_value {
+        let target: FoundValue = find_value(parsed, 1);
+        let body: OutBuf = delegation_json(spec, action.value, target.found && target.has_value, target.value);
+        return HandlerOut {
+            has_outcome: true,
+            result: Outcome.Unknown,
+            class: ExitClass.Incomplete,
+            stdout: body,
+            stderr: stderr_delegate_hint(spec.owner, spec.owner_len)
+        };
+    }
+    return usage_text(stderr_missing_required(schema.pad32(w_action(), 6), 6));
+}
+
+fn run_command(table: [CommandSpec; 9], spec: CommandSpec, parsed: ParseResult) -> (result: HandlerOut) {
+    if spec.code == 1 {
+        return handle_help(table, parsed);
+    }
+    if spec.code == 2 {
+        return handle_schema(table, parsed);
+    }
+    if spec.code == 3 {
+        return handle_version();
+    }
+    if spec.code == 4 {
+        return handle_verdict(parsed);
+    }
+    if spec.code == 5 {
+        return handle_delegate(spec, parsed);
+    }
+    if spec.code == 6 {
+        return handle_delegate(spec, parsed);
+    }
+    if spec.code == 7 {
+        return handle_delegate(spec, parsed);
+    }
+    if spec.code == 8 {
+        return handle_delegate(spec, parsed);
+    }
+    if spec.code == 9 {
+        return ok_text(help_index(table));
+    }
+    return HandlerOut {
+        has_outcome: false,
+        result: Outcome.Unknown,
+        class: ExitClass.Internal,
+        stdout: render.open(),
+        stderr: stderr_bad_command()
+    };
+}
+
+// Route a parser failure to its usage diagnostic.
+fn parse_error_text(spec: CommandSpec, parsed: ParseResult) -> (result: HandlerOut) {
+    return match parsed.error {
+        ParseErrorKind.None => usage_text(stderr_bad_command()),
+        ParseErrorKind.UnknownOption => usage_text(stderr_unknown_option(parsed.error_token)),
+        ParseErrorKind.MissingValue => usage_text(missing_value_note(spec, parsed.error_index)),
+        ParseErrorKind.MissingRequired => usage_text(missing_required_note(spec, parsed.error_index)),
+        ParseErrorKind.UnexpectedValue => usage_text(stderr_bad_value(parsed.error_token)),
+        ParseErrorKind.UnexpectedPositional => usage_text(stderr_extra_input(parsed.error_token)),
+        ParseErrorKind.TruncatedToken => usage_text(stderr_token_too_long()),
+    };
+}
+
+fn missing_value_note(spec: CommandSpec, index: u64) -> (result: OutBuf) {
+    let opts: [OptionSpec; 8] = spec.options;
+    let slot: u64 = select(index < 8, index, 0);
+    let entry: OptionSpec = opts[slot];
+    return stderr_missing_value(entry.name, entry.name_len);
+}
+
+fn missing_required_note(spec: CommandSpec, index: u64) -> (result: OutBuf) {
+    let opts: [OptionSpec; 8] = spec.options;
+    let slot: u64 = select(index < 8, index, 0);
+    let entry: OptionSpec = opts[slot];
+    return stderr_missing_required(entry.name, entry.name_len);
+}
+
+// --- dispatcher: argv tokens in, canonical exit out ---
+
+fn dispatch(argv: [Token; 8], argv_count: u64) -> (result: CommandExit) {
+    let table: [CommandSpec; 9] = command_table();
+    if argv_count > 8 {
+        return to_exit(usage_text(stderr_bad_command()));
+    }
+    if argv_count < 2 {
+        return to_exit(ok_text(help_index(table)));
+    }
+    let cmd: Token = argv[1];
+    if cmd.truncated {
+        return to_exit(usage_text(stderr_token_too_long()));
+    }
+    let hit: CommandHit = schema.find_command(table, cmd);
+    if hit.found == false {
+        return to_exit(usage_text(stderr_unknown_command(cmd)));
+    }
+    let slot: u64 = select(hit.index < 9, hit.index, 0);
+    let spec: CommandSpec = table[slot];
+    let e: Token = token.empty_token();
+    let blank: [Token; 8] = [e, e, e, e, e, e, e, e];
+    let rest: u64 = argv_count -% 2;
+    let take: u64 = select(rest <= 6, rest, 6);
+    let args: [Token; 8] = copy_span(blank, 0, argv, 2, take);
+    let parsed: ParseResult = parse.parse_args(spec, args, take);
+    if parsed.ok == false {
+        return to_exit(parse_error_text(spec, parsed));
+    }
+    return to_exit(run_command(table, spec, parsed));
+}

@@ -1,0 +1,128 @@
+mncs 0.18;
+
+// mncs.cli.render.v1 — bounded human and machine output rendering.
+//
+// An OutBuf is a 1024-byte exact window plus the live length and an `ok`
+// flag. Over-capacity appends poison `ok` instead of trapping or
+// wrapping (the `mncs.std.json_emit` Writer idiom at CLI scale). The CLI
+// owns human formatting (help text) and machine formatting (compact
+// JSON); semantic results and routing live elsewhere.
+//
+// Transport note: `finish` coerces the exact window into the
+// `[byte; up_to 1024]` stdout/stderr view. Current MNCS has no
+// length-preserving exact-to-view projection, so the coerced view reads
+// the full 1024-byte window and the significant prefix is `buf.len`
+// (recorded as pressure P-CLI-001). Host launchers slice `[..len]`;
+// native tests assert prefix content plus `len` on the OutBuf itself.
+
+module mncs.cli.render.v1;
+
+record OutBuf {
+    bytes: [byte; 1024],
+    len: u64,
+    ok: bool
+}
+
+record U64State {
+    buf: OutBuf,
+    rest: u64,
+    started: bool
+}
+
+fn open() -> (result: OutBuf) {
+    return OutBuf { bytes: [0; 1024], len: 0, ok: true };
+}
+
+// Raw byte append. Total: guarded, poisoning on overflow.
+fn put(buf: OutBuf, value: byte) -> (result: OutBuf) {
+    if buf.ok && buf.len < 1024 {
+        return OutBuf { ..buf, bytes: replace(buf.bytes, buf.len, value), len: buf.len +% 1 };
+    }
+    return OutBuf { ..buf, ok: false };
+}
+
+// Append the live prefix of an exact byte window.
+fn put_bytes(buf: OutBuf, src: [byte; 64], src_len: u64) -> (result: OutBuf) {
+    let live: u64 = select(src_len <= 64, src_len, 64);
+    if buf.ok && buf.len +% live <= 1024 {
+        return OutBuf {
+            ..buf,
+            bytes: copy_span(buf.bytes, buf.len, src, 0, live),
+            len: buf.len +% live
+        };
+    }
+    return OutBuf { ..buf, ok: false };
+}
+
+// Append the live prefix of one 8-byte spelling chunk (the pack8
+// vocabulary used for command names, keys, and fixed words).
+fn put_chunk8(buf: OutBuf, src: [byte; 8], src_len: u64) -> (result: OutBuf) {
+    let live: u64 = select(src_len <= 8, src_len, 8);
+    if buf.ok && buf.len +% live <= 1024 {
+        return OutBuf {
+            ..buf,
+            bytes: copy_span(buf.bytes, buf.len, src, 0, live),
+            len: buf.len +% live
+        };
+    }
+    return OutBuf { ..buf, ok: false };
+}
+
+fn put_name(buf: OutBuf, src: [byte; 32], src_len: u64) -> (result: OutBuf) {
+    let live: u64 = select(src_len <= 32, src_len, 32);
+    if buf.ok && buf.len +% live <= 1024 {
+        return OutBuf {
+            ..buf,
+            bytes: copy_span(buf.bytes, buf.len, src, 0, live),
+            len: buf.len +% live
+        };
+    }
+    return OutBuf { ..buf, ok: false };
+}
+
+fn newline(buf: OutBuf) -> (result: OutBuf) {
+    return put(buf, 10);
+}
+
+fn space(buf: OutBuf) -> (result: OutBuf) {
+    return put(buf, 32);
+}
+
+// Unsigned decimal rendering by a fixed divisor table: total, no heap,
+// no recursion. Emits `0` for zero.
+fn put_u64(buf: OutBuf, value: u64) -> (result: OutBuf) {
+    let divs: [u64; 20] = [10000000000000000000, 1000000000000000000, 100000000000000000, 10000000000000000, 1000000000000000, 100000000000000, 10000000000000, 1000000000000, 100000000000, 10000000000, 1000000000, 100000000, 10000000, 1000000, 100000, 10000, 1000, 100, 10, 1];
+    iterate i over divs carrying st: U64State = U64State { buf: buf, rest: value, started: false } {
+        let div: u64 = divs[i];
+        let digit: u64 = st.rest / div;
+        let emit: bool = st.started || digit != 0 || div == 1;
+        let grown: OutBuf = select(emit, put(st.buf, (48 +% digit) as byte), st.buf);
+        next st = U64State { buf: grown, rest: st.rest % div, started: st.started || emit };
+    }
+    return st.buf;
+}
+
+// A JSON string over the CLI name vocabulary (`[a-z0-9-]` needs no
+// escapes; the descriptor builder guarantees the alphabet).
+fn put_quoted_name(buf: OutBuf, src: [byte; 32], src_len: u64) -> (result: OutBuf) {
+    return put(put_name(put(buf, 34), src, src_len), 34);
+}
+
+fn put_quoted_token(buf: OutBuf, src: [byte; 64], src_len: u64) -> (result: OutBuf) {
+    return put(put_bytes(put(buf, 34), src, src_len), 34);
+}
+
+// JSON key: `"name":`.
+fn put_key(buf: OutBuf, name: [byte; 32], name_len: u64) -> (result: OutBuf) {
+    return put(put_quoted_name(buf, name, name_len), 58);
+}
+
+// Project the buffer into the stdout/stderr transport view. See the
+// module header: the significant prefix is `buf.len`.
+fn finish(buf: OutBuf) -> (result: [byte; up_to 1024]) {
+    return buf.bytes;
+}
+
+fn finished_len(buf: OutBuf) -> (result: u64) {
+    return buf.len;
+}

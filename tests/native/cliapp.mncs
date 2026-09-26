@@ -1,0 +1,282 @@
+mncs 0.18;
+
+// Native contracts for the mncs.cli reference dispatcher: routing,
+// human/machine output, exit codes, PASS/FAIL/UNKNOWN preservation,
+// stdout/stderr separation, and delegation boundaries. Expectations are
+// in-language assertions; byte prefixes pin the output contracts.
+
+module mncs.cli.test.cliapp.v1;
+
+use mncs.test.assertions;
+use mncs.test.suite;
+use mncs.cli.token.v1 as token;
+use mncs.cli.schema.v1 as schema;
+use mncs.cli.parse.v1 as parse;
+use mncs.cli.render.v1 as render;
+use mncs.cli.outcome.v1 as outcome;
+use mncs.std.application.v1 as appctx;
+use mncs.cli.app.v1 as app;
+
+// One argv entry from explicit bytes.
+fn word(bytes: [byte; up_to 1024], len: u64) -> (result: Token) {
+    return token.from_entry(bytes, len);
+}
+
+fn prog() -> (result: Token) {
+    let raw: [byte; up_to 1024] = [109, 110, 99, 115];
+    return token.from_entry(raw, 4);
+}
+
+fn argv2(b: Token) -> (result: [Token; 8]) {
+    let e: Token = token.empty_token();
+    return [prog(), b, e, e, e, e, e, e];
+}
+
+fn argv3(b: Token, c: Token) -> (result: [Token; 8]) {
+    let e: Token = token.empty_token();
+    return [prog(), b, c, e, e, e, e, e];
+}
+
+fn argv4(b: Token, c: Token, d: Token, e: Token) -> (result: [Token; 8]) {
+    let z: Token = token.empty_token();
+    return [prog(), b, c, d, e, z, z, z];
+}
+
+// First `n` stdout bytes as a token for prefix assertions.
+fn head(view: [byte; up_to 1024], n: u64) -> (result: Token) {
+    let blank: [byte; 64] = [0; 64];
+    let take: u64 = select(n <= 64, n, 64);
+    return token.from_bytes(copy_span(blank, 0, view, 0, take), take);
+}
+
+fn expect(bytes: [byte; 64], len: u64) -> (result: Token) {
+    return token.from_bytes(bytes, len);
+}
+
+// --- routing and human output ---
+
+test bare_invocation_lists_commands() -> (result: TestResult) {
+    let e: Token = token.empty_token();
+    let done: CommandExit = app.dispatch([e, e, e, e, e, e, e, e], 0);
+    let fin: ApplicationExit = done.exit;
+    let prefix: [byte; 64] = [109, 110, 99, 115, 32, 45, 32, 99, 111, 109, 109, 97, 110, 100, 32, 105, 110, 100, 101, 120, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let ok: bool = fin.exit_code == 0 && done.has_outcome && outcome.outcome_code(done.outcome) == 0;
+    let text: bool = token.token_eq(head(fin.stdout, 21), expect(prefix, 21));
+    return from_assertion(equals_bool(true, ok && text, 5001));
+}
+
+test prog_only_lists_commands() -> (result: TestResult) {
+    let done: CommandExit = app.dispatch(argv2(token.empty_token()), 1);
+    let fin: ApplicationExit = done.exit;
+    return from_assertion(equals_bool(true, fin.exit_code == 0, 5002));
+}
+
+test unknown_command_is_usage() -> (result: TestResult) {
+    let raw: [byte; up_to 1024] = [98, 111, 103, 117, 115];
+    let done: CommandExit = app.dispatch(argv2(word(raw, 5)), 2);
+    let fin: ApplicationExit = done.exit;
+    let code: bool = fin.exit_code == 64 && done.has_outcome == false;
+    let split: bool = fin.stdout[0] == 0 && fin.stderr[0] == 117;
+    return from_assertion(equals_bool(true, code && split, 5003));
+}
+
+test truncated_command_is_usage() -> (result: TestResult) {
+    let big: [byte; up_to 1024] = [45; 1024];
+    let done: CommandExit = app.dispatch(argv2(word(big, 100)), 2);
+    let fin: ApplicationExit = done.exit;
+    let code: bool = fin.exit_code == 64 && done.has_outcome == false;
+    let hint: bool = fin.stderr[0] == 116;
+    return from_assertion(equals_bool(true, code && hint, 5004));
+}
+
+test help_for_command() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [104, 101, 108, 112];
+    let opt_raw: [byte; up_to 1024] = [45, 45, 99, 111, 109, 109, 97, 110, 100];
+    let val_raw: [byte; up_to 1024] = [118, 101, 114, 100, 105, 99, 116];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 4), word(opt_raw, 9), word(val_raw, 7), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    let prefix: [byte; 64] = [109, 110, 99, 115, 32, 118, 101, 114, 100, 105, 99, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let ok: bool = fin.exit_code == 0;
+    let text: bool = token.token_eq(head(fin.stdout, 12), expect(prefix, 12));
+    return from_assertion(equals_bool(true, ok && text, 5005));
+}
+
+test help_unknown_command() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [104, 101, 108, 112];
+    let opt_raw: [byte; up_to 1024] = [45, 45, 99, 111, 109, 109, 97, 110, 100];
+    let val_raw: [byte; up_to 1024] = [122, 122, 122];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 4), word(opt_raw, 9), word(val_raw, 3), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    return from_assertion(equals_bool(true, fin.exit_code == 64 && done.has_outcome == false, 5006));
+}
+
+test commands_lists_index() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [99, 111, 109, 109, 97, 110, 100, 115];
+    let done: CommandExit = app.dispatch(argv2(word(cmd_raw, 8)), 2);
+    let fin: ApplicationExit = done.exit;
+    let prefix: [byte; 64] = [109, 110, 99, 115, 32, 45, 32, 99, 111, 109, 109, 97, 110, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let ok: bool = fin.exit_code == 0;
+    let text: bool = token.token_eq(head(fin.stdout, 14), expect(prefix, 14));
+    return from_assertion(equals_bool(true, ok && text, 5007));
+}
+
+// --- machine output ---
+
+test version_contract() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [118, 101, 114, 115, 105, 111, 110];
+    let done: CommandExit = app.dispatch(argv2(word(cmd_raw, 7)), 2);
+    let fin: ApplicationExit = done.exit;
+    let full: [byte; 64] = [123, 34, 110, 97, 109, 101, 34, 58, 34, 109, 110, 99, 115, 45, 99, 108, 105, 34, 44, 34, 118, 101, 114, 115, 105, 111, 110, 34, 58, 91, 48, 44, 49, 44, 48, 93, 44, 34, 112, 114, 111, 102, 105, 108, 101, 34, 58, 49, 56, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let exact: bool = token.token_eq(head(fin.stdout, 50), expect(full, 50));
+    let bounded: bool = fin.stdout[50] == 0;
+    let quiet: bool = fin.stderr[0] == 0;
+    let ok: bool = fin.exit_code == 0 && exact && bounded && quiet;
+    return from_assertion(equals_bool(true, ok, 5008));
+}
+
+test schema_for_version() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [115, 99, 104, 101, 109, 97];
+    let opt_raw: [byte; up_to 1024] = [45, 45, 99, 111, 109, 109, 97, 110, 100];
+    let val_raw: [byte; up_to 1024] = [118, 101, 114, 115, 105, 111, 110];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 6), word(opt_raw, 9), word(val_raw, 7), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    let prefix: [byte; 64] = [123, 34, 99, 111, 109, 109, 97, 110, 100, 34, 58, 34, 118, 101, 114, 115, 105, 111, 110, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let ok: bool = fin.exit_code == 0;
+    let text: bool = token.token_eq(head(fin.stdout, 20), expect(prefix, 20));
+    return from_assertion(equals_bool(true, ok && text, 5009));
+}
+
+test schema_missing_command() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [115, 99, 104, 101, 109, 97];
+    let done: CommandExit = app.dispatch(argv2(word(cmd_raw, 6)), 2);
+    let fin: ApplicationExit = done.exit;
+    let code: bool = fin.exit_code == 64 && done.has_outcome == false;
+    let hint: bool = fin.stderr[0] == 109;
+    return from_assertion(equals_bool(true, code && hint, 5010));
+}
+
+// --- verdict: PASS / FAIL / UNKNOWN preservation ---
+
+test verdict_pass_maps_zero() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [118, 101, 114, 100, 105, 99, 116];
+    let opt_raw: [byte; up_to 1024] = [45, 45, 111, 117, 116, 99, 111, 109, 101];
+    let val_raw: [byte; up_to 1024] = [112, 97, 115, 115];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 7), word(opt_raw, 9), word(val_raw, 4), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    let full: [byte; 64] = [123, 34, 99, 111, 109, 109, 97, 110, 100, 34, 58, 34, 118, 101, 114, 100, 105, 99, 116, 34, 44, 34, 111, 117, 116, 99, 111, 109, 101, 34, 58, 34, 112, 97, 115, 115, 34, 44, 34, 101, 120, 105, 116, 34, 58, 48, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let exact: bool = token.token_eq(head(fin.stdout, 47), expect(full, 47));
+    let bounded: bool = fin.stdout[47] == 0;
+    let kept: bool = done.has_outcome && outcome.outcome_code(done.outcome) == 0 && fin.exit_code == 0;
+    return from_assertion(equals_bool(true, kept && exact && bounded, 5011));
+}
+
+test verdict_fail_maps_one() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [118, 101, 114, 100, 105, 99, 116];
+    let opt_raw: [byte; up_to 1024] = [45, 45, 111, 117, 116, 99, 111, 109, 101];
+    let val_raw: [byte; up_to 1024] = [102, 97, 105, 108];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 7), word(opt_raw, 9), word(val_raw, 4), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    let kept: bool = done.has_outcome && outcome.outcome_code(done.outcome) == 1 && fin.exit_code == 1;
+    let cls: bool = outcome.class_code(done.class) == 1;
+    return from_assertion(equals_bool(true, kept && cls, 5012));
+}
+
+test verdict_unknown_maps_two() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [118, 101, 114, 100, 105, 99, 116];
+    let opt_raw: [byte; up_to 1024] = [45, 45, 111, 117, 116, 99, 111, 109, 101];
+    let val_raw: [byte; up_to 1024] = [117, 110, 107, 110, 111, 119, 110];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 7), word(opt_raw, 9), word(val_raw, 7), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    let full: [byte; 64] = [123, 34, 99, 111, 109, 109, 97, 110, 100, 34, 58, 34, 118, 101, 114, 100, 105, 99, 116, 34, 44, 34, 111, 117, 116, 99, 111, 109, 101, 34, 58, 34, 117, 110, 107, 110, 111, 119, 110, 34, 44, 34, 101, 120, 105, 116, 34, 58, 50, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let exact: bool = token.token_eq(head(fin.stdout, 50), expect(full, 50));
+    let bounded: bool = fin.stdout[50] == 0;
+    let kept: bool = done.has_outcome && outcome.outcome_code(done.outcome) == 2 && fin.exit_code == 2;
+    let cls: bool = outcome.class_code(done.class) == 2;
+    return from_assertion(equals_bool(true, kept && cls && exact && bounded, 5013));
+}
+
+test verdict_bad_word_is_usage() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [118, 101, 114, 100, 105, 99, 116];
+    let opt_raw: [byte; up_to 1024] = [45, 45, 111, 117, 116, 99, 111, 109, 101];
+    let val_raw: [byte; up_to 1024] = [98, 111, 103, 117, 115];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 7), word(opt_raw, 9), word(val_raw, 5), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    let code: bool = fin.exit_code == 64 && done.has_outcome == false;
+    let hint: bool = fin.stderr[0] == 117;
+    return from_assertion(equals_bool(true, code && hint, 5014));
+}
+
+test verdict_missing_outcome() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [118, 101, 114, 100, 105, 99, 116];
+    let done: CommandExit = app.dispatch(argv2(word(cmd_raw, 7)), 2);
+    let fin: ApplicationExit = done.exit;
+    return from_assertion(equals_bool(true, fin.exit_code == 64 && done.has_outcome == false, 5015));
+}
+
+// --- delegation: projection, never execution ---
+
+test forge_delegates_unknown() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [102, 111, 114, 103, 101];
+    let act_raw: [byte; up_to 1024] = [45, 45, 97, 99, 116, 105, 111, 110];
+    let act_val: [byte; up_to 1024] = [115, 116, 97, 114, 116];
+    let tgt_raw: [byte; up_to 1024] = [45, 45, 116, 97, 114, 103, 101, 116];
+    let tgt_val: [byte; up_to 1024] = [119, 49];
+    let e: Token = token.empty_token();
+    let argv: [Token; 8] = [prog(), word(cmd_raw, 5), word(act_raw, 8), word(act_val, 5), word(tgt_raw, 8), word(tgt_val, 2), e, e];
+    let done: CommandExit = app.dispatch(argv, 6);
+    let fin: ApplicationExit = done.exit;
+    let prefix: [byte; 64] = [123, 34, 99, 111, 109, 109, 97, 110, 100, 34, 58, 34, 102, 111, 114, 103, 101, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let routed: bool = fin.exit_code == 2 && done.has_outcome && outcome.outcome_code(done.outcome) == 2;
+    let cls: bool = outcome.class_code(done.class) == 2;
+    let text: bool = token.token_eq(head(fin.stdout, 18), expect(prefix, 18));
+    let hint: bool = fin.stderr[0] == 100;
+    return from_assertion(equals_bool(true, routed && cls && text && hint, 5016));
+}
+
+test forge_missing_action() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [102, 111, 114, 103, 101];
+    let done: CommandExit = app.dispatch(argv2(word(cmd_raw, 5)), 2);
+    let fin: ApplicationExit = done.exit;
+    return from_assertion(equals_bool(true, fin.exit_code == 64 && done.has_outcome == false, 5017));
+}
+
+test test_delegates() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [116, 101, 115, 116];
+    let act_raw: [byte; up_to 1024] = [45, 45, 97, 99, 116, 105, 111, 110];
+    let act_val: [byte; up_to 1024] = [114, 117, 110];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 4), word(act_raw, 8), word(act_val, 3), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    let prefix: [byte; 64] = [123, 34, 99, 111, 109, 109, 97, 110, 100, 34, 58, 34, 116, 101, 115, 116, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let routed: bool = fin.exit_code == 2 && done.has_outcome && outcome.outcome_code(done.outcome) == 2;
+    let text: bool = token.token_eq(head(fin.stdout, 17), expect(prefix, 17));
+    return from_assertion(equals_bool(true, routed && text, 5018));
+}
+
+test debug_delegates() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [100, 101, 98, 117, 103];
+    let act_raw: [byte; up_to 1024] = [45, 45, 97, 99, 116, 105, 111, 110];
+    let act_val: [byte; up_to 1024] = [115, 104, 111, 119];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 5), word(act_raw, 8), word(act_val, 4), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    return from_assertion(equals_bool(true, fin.exit_code == 2 && done.has_outcome, 5019));
+}
+
+test doctor_delegates() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [100, 111, 99, 116, 111, 114];
+    let act_raw: [byte; up_to 1024] = [45, 45, 97, 99, 116, 105, 111, 110];
+    let act_val: [byte; up_to 1024] = [99, 104, 101, 99, 107];
+    let done: CommandExit = app.dispatch(argv4(word(cmd_raw, 6), word(act_raw, 8), word(act_val, 5), token.empty_token()), 4);
+    let fin: ApplicationExit = done.exit;
+    return from_assertion(equals_bool(true, fin.exit_code == 2 && outcome.outcome_code(done.outcome) == 2, 5020));
+}
+
+test version_rejects_unknown_option() -> (result: TestResult) {
+    let cmd_raw: [byte; up_to 1024] = [118, 101, 114, 115, 105, 111, 110];
+    let opt_raw: [byte; up_to 1024] = [45, 45, 98, 111, 103, 117, 115];
+    let done: CommandExit = app.dispatch(argv3(word(cmd_raw, 7), word(opt_raw, 7)), 3);
+    let fin: ApplicationExit = done.exit;
+    let code: bool = fin.exit_code == 64 && done.has_outcome == false;
+    let hint: bool = fin.stderr[0] == 117;
+    let quiet: bool = fin.stdout[0] == 0;
+    return from_assertion(equals_bool(true, code && hint && quiet, 5021));
+}

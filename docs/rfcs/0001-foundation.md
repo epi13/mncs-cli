@@ -1,6 +1,6 @@
 # RFC 0001: CLI foundation
 
-Status: Draft
+Status: Implemented (2026-09-26: descriptor-driven parser, router, renderers, exit mapping, and native suites landed)
 
 ## Principles
 

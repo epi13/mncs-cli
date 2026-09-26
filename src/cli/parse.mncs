@@ -1,0 +1,269 @@
+mncs 0.18;
+
+// mncs.cli.parse.v1 — typed argv parsing against a command descriptor.
+//
+// `parse_args` folds at most 8 argument tokens into a ParseResult: one
+// ParsedValue per option occurrence plus positional tokens. Every failure
+// is a structured ParseErrorKind with the offending token attached — the
+// CLI never invents policy here, it only reports what the descriptor
+// admits.
+//
+// Parsing rules (fixed, documented, tested):
+// - `--name value` consumes the next token literally, even when it starts
+//   with `--`.
+// - `--name=value` attaches inline; it is an error on Flag options.
+// - A bare `--flag` sets presence; a bare `--value-option` waits for the
+//   next token and reports MissingValue at end of input.
+// - Unknown `--names` report UnknownOption; unknown bare tokens collect
+//   as positionals (window 8, overflow reports UnexpectedPositional).
+// - Truncated tokens (argv entries wider than 64 bytes) report
+//   TruncatedToken immediately: the parser never matches a prefix.
+// - Required options are checked after the fold; the first missing one
+//   reports MissingRequired with its option index.
+
+module mncs.cli.parse.v1;
+
+use mncs.cli.token.v1 as token;
+use mncs.cli.schema.v1 as schema;
+
+enum ParseErrorKind { None, UnknownOption, MissingValue, MissingRequired, UnexpectedValue, UnexpectedPositional, TruncatedToken }
+
+// Numeric projection of parse failures for hosts and tests: the language
+// has no enum equality, so codes are the stable comparison vocabulary.
+fn error_code(error: ParseErrorKind) -> (result: u64) {
+    return match error {
+        ParseErrorKind.None => 0,
+        ParseErrorKind.UnknownOption => 1,
+        ParseErrorKind.MissingValue => 2,
+        ParseErrorKind.MissingRequired => 3,
+        ParseErrorKind.UnexpectedValue => 4,
+        ParseErrorKind.UnexpectedPositional => 5,
+        ParseErrorKind.TruncatedToken => 6,
+    };
+}
+
+record ParsedValue {
+    option_index: u64,
+    has_value: bool,
+    value: Token
+}
+
+record ParseResult {
+    ok: bool,
+    error: ParseErrorKind,
+    error_token: Token,
+    error_index: u64,
+    values: [ParsedValue; 8],
+    value_count: u64,
+    positionals: [Token; 8],
+    positional_count: u64
+}
+
+record ParseState {
+    failed: bool,
+    error: ParseErrorKind,
+    error_token: Token,
+    error_index: u64,
+    present: [bool; 8],
+    slot_value: [Token; 8],
+    positionals: [Token; 8],
+    positional_count: u64,
+    pending: u64
+}
+
+fn blank_value() -> (result: ParsedValue) {
+    return ParsedValue { option_index: 8, has_value: false, value: token.empty_token() };
+}
+
+fn initial_state() -> (result: ParseState) {
+    let no: Token = token.empty_token();
+    return ParseState {
+        failed: false,
+        error: ParseErrorKind.None,
+        error_token: no,
+        error_index: 8,
+        present: [false; 8],
+        slot_value: [no, no, no, no, no, no, no, no],
+        positionals: [no, no, no, no, no, no, no, no],
+        positional_count: 0,
+        pending: 8
+    };
+}
+
+fn fail_state(state: ParseState, error: ParseErrorKind, bad: Token, index: u64) -> (result: ParseState) {
+    return ParseState {
+        ..state,
+        failed: true,
+        error: error,
+        error_token: bad,
+        error_index: index
+    };
+}
+
+// One fold step. `args` is the full 8-window; only `i < arg_count` steps
+// act, the rest carry the state unchanged.
+fn step(spec: CommandSpec, state: ParseState, args: [Token; 8], arg_count: u64, i: u64) -> (result: ParseState) {
+    if state.failed {
+        return state;
+    }
+    let live: bool = i < arg_count;
+    if live == false {
+        return state;
+    }
+    let slot: u64 = select(i < 8, i, 0);
+    let current: Token = args[slot];
+    if current.truncated {
+        return fail_state(state, ParseErrorKind.TruncatedToken, current, 8);
+    }
+    // A value-option waiting for its value consumes literally.
+    if state.pending != 8 {
+        let opt: u64 = select(state.pending < 8, state.pending, 0);
+        return ParseState {
+            ..state,
+            present: replace(state.present, opt, true),
+            slot_value: replace(state.slot_value, opt, current),
+            pending: 8
+        };
+    }
+    if token.is_long_assignment(current) {
+        return step_assignment(spec, state, current);
+    }
+    if token.is_long_flag(current) {
+        return step_flag(spec, state, current);
+    }
+    return step_positional(state, current);
+}
+
+// Handle `--name=value`.
+fn step_assignment(spec: CommandSpec, state: ParseState, current: Token) -> (result: ParseState) {
+    let parts: NameValue = token.split_assignment(current);
+    let bare: Token = token.strip_dashes(parts.name);
+    let hit: OptionHit = schema.find_option(spec, bare);
+    if hit.found == false {
+        return fail_state(state, ParseErrorKind.UnknownOption, current, 8);
+    }
+    let slot: u64 = select(hit.index < 8, hit.index, 0);
+    let entry: OptionSpec = spec.options[slot];
+    if schema.option_takes_value(entry) == false {
+        return fail_state(state, ParseErrorKind.UnexpectedValue, current, hit.index);
+    }
+    return ParseState {
+        ..state,
+        present: replace(state.present, slot, true),
+        slot_value: replace(state.slot_value, slot, parts.value)
+    };
+}
+
+// Handle a bare `--name`.
+fn step_flag(spec: CommandSpec, state: ParseState, current: Token) -> (result: ParseState) {
+    let bare: Token = token.strip_dashes(current);
+    let hit: OptionHit = schema.find_option(spec, bare);
+    if hit.found == false {
+        return fail_state(state, ParseErrorKind.UnknownOption, current, 8);
+    }
+    let slot: u64 = select(hit.index < 8, hit.index, 0);
+    let entry: OptionSpec = spec.options[slot];
+    if schema.option_takes_value(entry) {
+        return ParseState { ..state, pending: hit.index };
+    }
+    return ParseState {
+        ..state,
+        present: replace(state.present, slot, true),
+        slot_value: replace(state.slot_value, slot, token.empty_token())
+    };
+}
+
+// Handle a positional token.
+fn step_positional(state: ParseState, current: Token) -> (result: ParseState) {
+    if state.positional_count < 8 {
+        let slot: u64 = select(state.positional_count < 8, state.positional_count, 0);
+        return ParseState {
+            ..state,
+            positionals: replace(state.positionals, slot, current),
+            positional_count: state.positional_count +% 1
+        };
+    }
+    return fail_state(state, ParseErrorKind.UnexpectedPositional, current, 8);
+}
+
+// Compact per-option presence into the result value list.
+fn collect_values(spec: CommandSpec, state: ParseState) -> (result: ParseResult) {
+    let bv: ParsedValue = blank_value();
+    let seed: ParseResult = ParseResult {
+        ok: true,
+        error: ParseErrorKind.None,
+        error_token: token.empty_token(),
+        error_index: 8,
+        values: [bv, bv, bv, bv, bv, bv, bv, bv],
+        value_count: 0,
+        positionals: state.positionals,
+        positional_count: state.positional_count
+    };
+    let marks: [bool; 8] = state.present;
+    let slot_values: [Token; 8] = state.slot_value;
+    let opts: [OptionSpec; 8] = spec.options;
+    iterate j over marks carrying out: ParseResult = seed {
+        let slot: u64 = select(j < 8, j, 0);
+        let entry: OptionSpec = opts[slot];
+        let active: bool = j < spec.option_count && marks[slot];
+        let item: ParsedValue = ParsedValue {
+            option_index: j,
+            has_value: schema.option_takes_value(entry),
+            value: slot_values[slot]
+        };
+        let at: u64 = select(out.value_count < 8, out.value_count, 0);
+        next out = ParseResult {
+            ..out,
+            values: select(active, replace(out.values, at, item), out.values),
+            value_count: select(active, out.value_count +% 1, out.value_count)
+        };
+    }
+    return out;
+}
+
+fn parse_args(spec: CommandSpec, args: [Token; 8], arg_count: u64) -> (result: ParseResult) {
+    let folded: ParseState = initial_state();
+    iterate i over args carrying state: ParseState = folded {
+        next state = step(spec, state, args, arg_count, i);
+    }
+    if state.failed {
+        let bv: ParsedValue = blank_value();
+        return ParseResult {
+            ok: false,
+            error: state.error,
+            error_token: state.error_token,
+            error_index: state.error_index,
+            values: [bv, bv, bv, bv, bv, bv, bv, bv],
+            value_count: 0,
+            positionals: state.positionals,
+            positional_count: state.positional_count
+        };
+    }
+    if state.pending != 8 {
+        let bv: ParsedValue = blank_value();
+        return ParseResult {
+            ok: false,
+            error: ParseErrorKind.MissingValue,
+            error_token: token.empty_token(),
+            error_index: state.pending,
+            values: [bv, bv, bv, bv, bv, bv, bv, bv],
+            value_count: 0,
+            positionals: state.positionals,
+            positional_count: state.positional_count
+        };
+    }
+    if schema.required_satisfied(spec, state.present) == false {
+        let bv: ParsedValue = blank_value();
+        return ParseResult {
+            ok: false,
+            error: ParseErrorKind.MissingRequired,
+            error_token: token.empty_token(),
+            error_index: schema.first_missing_required(spec, state.present),
+            values: [bv, bv, bv, bv, bv, bv, bv, bv],
+            value_count: 0,
+            positionals: state.positionals,
+            positional_count: state.positional_count
+        };
+    }
+    return collect_values(spec, state);
+}

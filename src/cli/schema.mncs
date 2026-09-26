@@ -1,0 +1,163 @@
+mncs 0.18;
+
+// mncs.cli.schema.v1 — declarative command descriptors.
+//
+// A CommandSpec is typed data, not a parser callback: names, options,
+// delegation metadata, and bounded help text live in one record. Help,
+// machine-readable schemas, shell completion sketches, and the parser all
+// consume the same descriptor, so they cannot drift apart.
+//
+// Delegation: `delegated = true` marks commands whose semantics belong to
+// another subsystem (Forge, Test, Debug, Doctor, ...). The CLI owns the
+// descriptor, argument validation, and formatting; execution stays with
+// `owner`. The dispatcher never executes a delegated command inline — it
+// returns a delegation record the host launcher routes canonically.
+
+module mncs.cli.schema.v1;
+
+use mncs.cli.token.v1 as token;
+
+enum OptionKind { Flag, Value }
+
+record OptionSpec {
+    name: [byte; 32],
+    name_len: u64,
+    kind: OptionKind,
+    required: bool
+}
+
+record CommandSpec {
+    code: i64,
+    name: [byte; 32],
+    name_len: u64,
+    summary: [byte; 64],
+    summary_len: u64,
+    options: [OptionSpec; 8],
+    option_count: u64,
+    delegated: bool,
+    owner: [byte; 32],
+    owner_len: u64
+}
+
+record OptionHit {
+    found: bool,
+    index: u64
+}
+
+record CommandHit {
+    found: bool,
+    index: u64
+}
+
+// Option-kind decisions go through `match`: the language has no enum
+// equality, so callers never write `kind == OptionKind.Value`.
+fn option_takes_value(entry: OptionSpec) -> (result: bool) {
+    return match entry.kind {
+        OptionKind.Value => true,
+        OptionKind.Flag => false,
+    };
+}
+
+fn empty_option() -> (result: OptionSpec) {
+    return OptionSpec {
+        name: [0; 32],
+        name_len: 0,
+        kind: OptionKind.Flag,
+        required: false
+    };
+}
+
+// Pad one 8-byte spelling chunk into the 32-byte name window.
+fn pad32(chunk: [byte; 8], len: u64) -> (result: [byte; 32]) {
+    let blank: [byte; 32] = [0; 32];
+    let live: u64 = select(len <= 8, len, 8);
+    return copy_span(blank, 0, chunk, 0, live);
+}
+
+// Assemble a summary (at most 24 bytes) from three 8-byte chunks.
+fn pad_summary(c0: [byte; 8], c1: [byte; 8], c2: [byte; 8], len: u64) -> (result: [byte; 64]) {
+    let blank: [byte; 64] = [0; 64];
+    let live: u64 = select(len <= 24, len, 24);
+    let first: u64 = select(live <= 8, live, 8);
+    let rest: u64 = live -% first;
+    let second: u64 = select(rest <= 8, rest, 8);
+    let third: u64 = rest -% second;
+    let s1: [byte; 64] = copy_span(blank, 0, c0, 0, first);
+    let s2: [byte; 64] = copy_span(s1, 8, c1, 0, second);
+    return copy_span(s2, 16, c2, 0, third);
+}
+
+fn make_option(chunk: [byte; 8], name_len: u64, kind: OptionKind, required: bool) -> (result: OptionSpec) {
+    return OptionSpec {
+        name: pad32(chunk, name_len),
+        name_len: select(name_len <= 8, name_len, 8),
+        kind: kind,
+        required: required
+    };
+}
+
+fn make_command(code: i64, chunk: [byte; 8], name_len: u64, s0: [byte; 8], s1: [byte; 8], s2: [byte; 8], summary_len: u64, o0: OptionSpec, o1: OptionSpec, o2: OptionSpec, option_count: u64, delegated: bool, owner: [byte; 8], owner_len: u64) -> (result: CommandSpec) {
+    let no: OptionSpec = empty_option();
+    return CommandSpec {
+        code: code,
+        name: pad32(chunk, name_len),
+        name_len: select(name_len <= 8, name_len, 8),
+        summary: pad_summary(s0, s1, s2, summary_len),
+        summary_len: select(summary_len <= 24, summary_len, 24),
+        options: [o0, o1, o2, no, no, no, no, no],
+        option_count: select(option_count <= 3, option_count, 3),
+        delegated: delegated,
+        owner: pad32(owner, owner_len),
+        owner_len: select(owner_len <= 8, owner_len, 8)
+    };
+}
+
+// Look up a bare option name (`format`, not `--format`) in a command.
+fn find_option(spec: CommandSpec, name: Token) -> (result: OptionHit) {
+    let opts: [OptionSpec; 8] = spec.options;
+    iterate i over opts carrying hit: OptionHit = OptionHit { found: false, index: 0 } {
+        let live: bool = i < spec.option_count;
+        let entry: OptionSpec = opts[i];
+        let is_match: bool = live && token.name_matches(name, entry.name, entry.name_len);
+        next hit = select(is_match, OptionHit { found: true, index: i }, hit);
+    }
+    return hit;
+}
+
+// Look up a command name in a command table. Tables are caller-owned
+// data; duplicate names resolve to the LAST entry, deterministically.
+fn find_command<N: Nat>(table: [CommandSpec; N], name: Token) -> (result: CommandHit) {
+    iterate i over table carrying hit: CommandHit = CommandHit { found: false, index: 0 } {
+        let entry: CommandSpec = table[i];
+        let is_match: bool = token.name_matches(name, entry.name, entry.name_len);
+        next hit = select(is_match, CommandHit { found: true, index: i }, hit);
+    }
+    return hit;
+}
+
+// True when every required option of `spec` is marked present.
+fn required_satisfied(spec: CommandSpec, present: [bool; 8]) -> (result: bool) {
+    let opts: [OptionSpec; 8] = spec.options;
+    iterate i over opts carrying ok: bool = true {
+        let live: bool = i < spec.option_count;
+        let entry: OptionSpec = opts[i];
+        let need: bool = live && entry.required;
+        let slot: u64 = select(i < 8, i, 0);
+        let have: bool = select(live, present[slot], true);
+        next ok = ok && select(need, have, true);
+    }
+    return ok;
+}
+
+// Index of the first required option missing from `present`, or 8.
+fn first_missing_required(spec: CommandSpec, present: [bool; 8]) -> (result: u64) {
+    let opts: [OptionSpec; 8] = spec.options;
+    iterate i over opts carrying missing: u64 = 8 {
+        let live: bool = i < spec.option_count;
+        let entry: OptionSpec = opts[i];
+        let slot: u64 = select(i < 8, i, 0);
+        let need: bool = live && entry.required && present[slot] == false;
+        next missing = select(need && missing == 8, i, missing);
+    }
+    return missing;
+}

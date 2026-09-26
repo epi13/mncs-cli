@@ -1,0 +1,128 @@
+mncs 0.18;
+
+// mncs.cli.outcome.v1 — outcome-preserving exit mapping.
+//
+// A CommandExit carries three separated facts: the semantic Outcome
+// (PASS / FAIL / UNKNOWN), the process ExitClass, and the ApplicationExit
+// transport value (stdout bytes, stderr bytes, numeric code). Formatting
+// may change without touching semantics, and the numeric code never
+// replaces the Outcome value: UNKNOWN is preserved exactly, never folded
+// into FAIL or reported as PASS.
+//
+// Exit-code contract (documented, tested):
+//   Success      (Outcome Pass) -> 0
+//   SemanticFail (Outcome Fail) -> 1
+//   Incomplete   (Outcome Unknown) -> 2
+//   Usage        (invalid invocation) -> 64
+//   Unavailable  (canonical service missing) -> 69
+//   Internal     (CLI defect) -> 70
+//
+// stdout/stderr discipline: structured result data goes to stdout,
+// human diagnostics and progress go to stderr. Builders take both sides
+// explicitly so a command cannot accidentally mix logs into data.
+
+module mncs.cli.outcome.v1;
+
+use mncs.std.application.v1 as app;
+
+enum Outcome { Pass, Fail, Unknown }
+
+enum ExitClass { Success, SemanticFail, Incomplete, Usage, Unavailable, Internal }
+
+record CommandExit {
+    has_outcome: bool,
+    outcome: Outcome,
+    class: ExitClass,
+    exit: ApplicationExit
+}
+
+fn exit_code(class: ExitClass) -> (result: i64) {
+    return match class {
+        ExitClass.Success => 0,
+        ExitClass.SemanticFail => 1,
+        ExitClass.Incomplete => 2,
+        ExitClass.Usage => 64,
+        ExitClass.Unavailable => 69,
+        ExitClass.Internal => 70,
+    };
+}
+
+// Numeric projections for hosts and tests (no enum equality).
+fn outcome_code(outcome: Outcome) -> (result: u64) {
+    return match outcome {
+        Outcome.Pass => 0,
+        Outcome.Fail => 1,
+        Outcome.Unknown => 2,
+    };
+}
+
+fn class_code(class: ExitClass) -> (result: u64) {
+    return match class {
+        ExitClass.Success => 0,
+        ExitClass.SemanticFail => 1,
+        ExitClass.Incomplete => 2,
+        ExitClass.Usage => 3,
+        ExitClass.Unavailable => 4,
+        ExitClass.Internal => 5,
+    };
+}
+
+fn class_for_outcome(outcome: Outcome) -> (result: ExitClass) {
+    return match outcome {
+        Outcome.Pass => ExitClass.Success,
+        Outcome.Fail => ExitClass.SemanticFail,
+        Outcome.Unknown => ExitClass.Incomplete,
+    };
+}
+
+fn outcome_is_pass(outcome: Outcome) -> (result: bool) {
+    return match outcome {
+        Outcome.Pass => true,
+        Outcome.Fail => false,
+        Outcome.Unknown => false,
+    };
+}
+
+// Semantic completion: the Outcome selects the exit class; the Outcome
+// value itself travels alongside, unaltered.
+fn complete(outcome: Outcome, stdout: [byte; up_to 1024], stderr: [byte; up_to 1024]) -> (result: CommandExit) {
+    let class: ExitClass = class_for_outcome(outcome);
+    return CommandExit {
+        has_outcome: true,
+        outcome: outcome,
+        class: class,
+        exit: ApplicationExit { stdout: stdout, stderr: stderr, exit_code: exit_code(class) }
+    };
+}
+
+// No semantic outcome exists for these failures; `has_outcome` stays
+// false so no caller can read them as PASS, FAIL, or UNKNOWN. Both sides
+// travel through: the stdout projection is the caller's (empty,
+// zero-filled) window, never a length-zero literal, so transport stays a
+// uniform 1024-byte window on every path.
+fn fail_usage(stdout: [byte; up_to 1024], stderr: [byte; up_to 1024]) -> (result: CommandExit) {
+    return CommandExit {
+        has_outcome: false,
+        outcome: Outcome.Unknown,
+        class: ExitClass.Usage,
+        exit: ApplicationExit { stdout: stdout, stderr: stderr, exit_code: exit_code(ExitClass.Usage) }
+    };
+}
+
+fn fail_unavailable(stdout: [byte; up_to 1024], stderr: [byte; up_to 1024]) -> (result: CommandExit) {
+    return CommandExit {
+        has_outcome: false,
+        outcome: Outcome.Unknown,
+        class: ExitClass.Unavailable,
+        exit: ApplicationExit { stdout: stdout, stderr: stderr, exit_code: exit_code(ExitClass.Unavailable) }
+    };
+}
+
+fn fail_internal(stdout: [byte; up_to 1024], stderr: [byte; up_to 1024]) -> (result: CommandExit) {
+    return CommandExit {
+        has_outcome: false,
+        outcome: Outcome.Unknown,
+        class: ExitClass.Internal,
+        exit: ApplicationExit { stdout: stdout, stderr: stderr, exit_code: exit_code(ExitClass.Internal) }
+    };
+}
