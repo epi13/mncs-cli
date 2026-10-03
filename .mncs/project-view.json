@@ -1,0 +1,22 @@
+{
+  "capabilities": [
+    {
+      "contract": "cli-interface",
+      "fingerprint_sources": [
+        "src/cli/"
+      ],
+      "kind": "mncs-library",
+      "stability": "experimental",
+      "version": "0.1"
+    }
+  ],
+  "dependencies": [],
+  "entry": [
+    "python3 scripts/run_tests.py"
+  ],
+  "purpose": "The canonical MNCS-native command-line interface layer: typed command descriptors, argument parsing, routing, human/machine formatting, and exit-code mapping over the persistent MNCS system -- a projection, not an authority.",
+  "repository": "mncs-cli",
+  "schema_version": "mncs.project-view/1",
+  "source_identity": "sha256:ab1121befe5cc7065cf03da320c50f2ee712d2fa45109cfa95c936805c54f63c",
+  "structure": {}
+}

@@ -1,6 +1,19 @@
 # mncs-cli
 
 <!-- MNCS:generated:begin -->
+## Project entry
+
+The canonical MNCS-native command-line interface layer: typed command descriptors, argument parsing, routing, human/machine formatting, and exit-code mapping over the persistent MNCS system -- a projection, not an authority.
+
+```bash
+python3 scripts/run_tests.py
+```
+
+Declared capabilities (declarations do not establish execution health):
+
+- `cli-interface/0.1` — mncs-library (experimental)
+
+Semantic sources and ownership: `.mncs/projections.json`.
 <!-- MNCS:generated:end -->
 
 The canonical MNCS-native command-line interface layer: typed command
