@@ -1,5 +1,8 @@
 # mncs-cli
 
+<!-- MNCS:generated:begin -->
+<!-- MNCS:generated:end -->
+
 The canonical MNCS-native command-line interface layer: typed command
 descriptors, argument parsing, routing, human/machine formatting, and
 exit-code mapping over the persistent MNCS system.
